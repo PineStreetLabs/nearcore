@@ -1,4 +1,5 @@
-use crate::{EpochManager, EpochManagerHandle};
+use crate::types::BlockHeaderInfo;
+use crate::EpochManagerHandle;
 use near_chain_primitives::Error;
 use near_crypto::Signature;
 use near_primitives::block_header::{Approval, ApprovalInner, BlockHeader};
@@ -17,17 +18,14 @@ use near_primitives::types::{
 };
 use near_primitives::version::ProtocolVersion;
 use near_primitives::views::EpochValidatorInfo;
-use near_store::ShardUId;
+use near_store::{ShardUId, StoreUpdate};
 use std::cmp::Ordering;
-use std::sync::{Arc, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::Arc;
 
 /// A trait that abstracts the interface of the EpochManager.
-///
-/// It is intended to be an intermediate state in a refactor: we want to remove
-/// epoch manager stuff from RuntimeWithEpochManagerAdapter's interface, and, as a first step,
-/// we move it to a new trait. The end goal is for the code to use the concrete
-/// epoch manager type directly. Though, we might want to still keep this trait
-/// in, to allow for easy overriding of epoch manager in tests.
+/// The two implementations are EpochManagerHandle and KeyValueEpochManager.
+/// Strongly prefer the former whenever possible. The latter is for legacy
+/// tests.
 pub trait EpochManagerAdapter: Send + Sync {
     /// Check if epoch exists.
     fn epoch_exists(&self, epoch_id: &EpochId) -> bool;
@@ -87,6 +85,9 @@ pub trait EpochManagerAdapter: Send + Sync {
         &self,
         parent_hash: &CryptoHash,
     ) -> Result<EpochHeight, EpochError>;
+
+    /// Get next epoch id given hash of the current block.
+    fn get_next_epoch_id(&self, block_hash: &CryptoHash) -> Result<EpochId, EpochError>;
 
     /// Get next epoch id given hash of previous block.
     fn get_next_epoch_id_from_prev_block(
@@ -198,6 +199,11 @@ pub trait EpochManagerAdapter: Send + Sync {
         &self,
         epoch_id: ValidatorInfoIdentifier,
     ) -> Result<EpochValidatorInfo, EpochError>;
+
+    fn add_validator_proposals(
+        &self,
+        block_header_info: BlockHeaderInfo,
+    ) -> Result<StoreUpdate, EpochError>;
 
     /// Amount of tokens minted in given epoch.
     fn get_epoch_minted_amount(&self, epoch_id: &EpochId) -> Result<Balance, EpochError>;
@@ -368,29 +374,11 @@ pub trait EpochManagerAdapter: Send + Sync {
         account_id: &AccountId,
         shard_id: ShardId,
     ) -> Result<bool, EpochError>;
+
+    fn will_shard_layout_change(&self, parent_hash: &CryptoHash) -> Result<bool, EpochError>;
 }
 
-/// A technical plumbing trait to conveniently implement [`EpochManagerAdapter`]
-/// for `NightshadeRuntime` without too much copy-paste.
-///
-/// Once we remove `RuntimeWithEpochManagerAdapter: EpochManagerAdapter` bound, we could get rid
-/// of this trait and instead add inherent methods directly to
-/// `EpochManagerHandle`.
-pub trait HasEpochMangerHandle {
-    fn write(&self) -> RwLockWriteGuard<EpochManager>;
-    fn read(&self) -> RwLockReadGuard<EpochManager>;
-}
-
-impl HasEpochMangerHandle for EpochManagerHandle {
-    fn write(&self) -> RwLockWriteGuard<EpochManager> {
-        self.write()
-    }
-    fn read(&self) -> RwLockReadGuard<EpochManager> {
-        self.read()
-    }
-}
-
-impl<T: HasEpochMangerHandle + Send + Sync> EpochManagerAdapter for T {
+impl EpochManagerAdapter for EpochManagerHandle {
     fn epoch_exists(&self, epoch_id: &EpochId) -> bool {
         let epoch_manager = self.read();
         epoch_manager.get_epoch_info(epoch_id).is_ok()
@@ -496,6 +484,11 @@ impl<T: HasEpochMangerHandle + Send + Sync> EpochManagerAdapter for T {
             .get_epoch_info(&epoch_id)
             .map(|info| info.epoch_height())
             .map_err(EpochError::from)
+    }
+
+    fn get_next_epoch_id(&self, block_hash: &CryptoHash) -> Result<EpochId, EpochError> {
+        let epoch_manager = self.read();
+        epoch_manager.get_next_epoch_id(block_hash).map_err(EpochError::from)
     }
 
     fn get_next_epoch_id_from_prev_block(
@@ -655,7 +648,15 @@ impl<T: HasEpochMangerHandle + Send + Sync> EpochManagerAdapter for T {
         epoch_id: ValidatorInfoIdentifier,
     ) -> Result<EpochValidatorInfo, EpochError> {
         let epoch_manager = self.read();
-        epoch_manager.get_validator_info(epoch_id).map_err(|e| e.into())
+        epoch_manager.get_validator_info(epoch_id)
+    }
+
+    fn add_validator_proposals(
+        &self,
+        block_header_info: BlockHeaderInfo,
+    ) -> Result<StoreUpdate, EpochError> {
+        let mut epoch_manager = self.write();
+        epoch_manager.add_validator_proposals(block_header_info)
     }
 
     fn get_epoch_minted_amount(&self, epoch_id: &EpochId) -> Result<Balance, EpochError> {
@@ -933,5 +934,10 @@ impl<T: HasEpochMangerHandle + Send + Sync> EpochManagerAdapter for T {
             account_id,
             shard_id,
         )
+    }
+
+    fn will_shard_layout_change(&self, parent_hash: &CryptoHash) -> Result<bool, EpochError> {
+        let epoch_manager = self.read();
+        epoch_manager.will_shard_layout_change(parent_hash)
     }
 }

@@ -4,11 +4,11 @@ use crate::{utils::read_resource, REAL_CONTRACTS_SAMPLE};
 use near_primitives::contract::ContractCode;
 use near_primitives::hash::CryptoHash;
 use near_primitives::runtime::config_store::RuntimeConfigStore;
-use near_primitives::types::{CompiledContract, CompiledContractCache};
 use near_primitives::version::PROTOCOL_VERSION;
 use near_store::StoreCompiledContractCache;
-use near_vm_logic::VMContext;
 use near_vm_runner::internal::VMKind;
+use near_vm_runner::logic::VMContext;
+use near_vm_runner::logic::{CompiledContract, CompiledContractCache};
 
 const CURRENT_ACCOUNT_ID: &str = "alice";
 const SIGNER_ACCOUNT_ID: &str = "bob";

@@ -1,19 +1,20 @@
 use crate::errors::{ContractPrecompilatonResult, IntoVMError};
 use crate::internal::VMKind;
+use crate::logic::errors::{
+    CacheError, CompilationError, FunctionCallError, MethodResolveError, VMRunnerError, WasmTrap,
+};
+use crate::logic::types::PromiseResult;
+use crate::logic::{
+    CompiledContract, CompiledContractCache, External, VMContext, VMLogic, VMLogicError, VMOutcome,
+};
 use crate::memory::WasmerMemory;
 use crate::prepare;
 use crate::runner::VMResult;
 use crate::{get_contract_cache_key, imports};
-use near_primitives::config::VMConfig;
-use near_primitives::contract::ContractCode;
-use near_primitives::runtime::fees::RuntimeFeesConfig;
-use near_primitives::types::{CompiledContract, CompiledContractCache};
-use near_primitives::version::ProtocolVersion;
-use near_vm_errors::{
-    CacheError, CompilationError, FunctionCallError, MethodResolveError, VMRunnerError, WasmTrap,
-};
-use near_vm_logic::types::PromiseResult;
-use near_vm_logic::{External, VMContext, VMLogic, VMLogicError, VMOutcome};
+use near_primitives_core::config::VMConfig;
+use near_primitives_core::contract::ContractCode;
+use near_primitives_core::runtime::fees::RuntimeFeesConfig;
+use near_primitives_core::types::ProtocolVersion;
 use wasmer_runtime::{ImportObject, Module};
 
 fn check_method(module: &Module, method_name: &str) -> Result<(), FunctionCallError> {
@@ -246,7 +247,7 @@ impl Wasmer0VM {
         code: &ContractCode,
     ) -> Result<wasmer_runtime::Module, CompilationError> {
         let _span = tracing::debug_span!(target: "vm", "Wasmer0VM::compile_uncached").entered();
-        let prepared_code = prepare::prepare_contract(code.code(), &self.config)
+        let prepared_code = prepare::prepare_contract(code.code(), &self.config, VMKind::Wasmer0)
             .map_err(CompilationError::PrepareError)?;
         wasmer_runtime::compile(&prepared_code).map_err(|err| match err {
             wasmer_runtime::error::CompileError::ValidationError { .. } => {
@@ -338,21 +339,7 @@ impl Wasmer0VM {
                 })
             };
 
-        #[cfg(feature = "no_cache")]
         return compile_or_read_from_cache();
-
-        #[cfg(not(feature = "no_cache"))]
-        return {
-            static MEM_CACHE: once_cell::sync::Lazy<
-                near_cache::SyncLruCache<
-                    near_primitives::hash::CryptoHash,
-                    Result<wasmer_runtime::Module, CompilationError>,
-                >,
-            > = once_cell::sync::Lazy::new(|| {
-                near_cache::SyncLruCache::new(crate::cache::CACHE_SIZE)
-            });
-            MEM_CACHE.get_or_try_put(key, |_key| compile_or_read_from_cache())
-        };
     }
 }
 
@@ -448,8 +435,10 @@ impl crate::runner::VM for Wasmer0VM {
         &self,
         code: &ContractCode,
         cache: &dyn CompiledContractCache,
-    ) -> Result<Result<ContractPrecompilatonResult, CompilationError>, near_vm_errors::CacheError>
-    {
+    ) -> Result<
+        Result<ContractPrecompilatonResult, CompilationError>,
+        crate::logic::errors::CacheError,
+    > {
         Ok(self
             .compile_and_cache(code, Some(cache))?
             .map(|_| ContractPrecompilatonResult::ContractCompiled))

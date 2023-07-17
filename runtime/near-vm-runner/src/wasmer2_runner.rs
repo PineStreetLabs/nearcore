@@ -1,22 +1,23 @@
 use crate::errors::ContractPrecompilatonResult;
 use crate::imports::wasmer2::Wasmer2Imports;
 use crate::internal::VMKind;
-use crate::prepare::{self, WASM_FEATURES};
+use crate::logic::errors::{
+    CacheError, CompilationError, FunctionCallError, MethodResolveError, VMRunnerError, WasmTrap,
+};
+use crate::logic::gas_counter::FastGasCounter;
+use crate::logic::types::{PromiseResult, ProtocolVersion};
+use crate::logic::{
+    CompiledContract, CompiledContractCache, External, MemSlice, MemoryLike, VMConfig, VMContext,
+    VMLogic, VMOutcome,
+};
+use crate::prepare;
 use crate::runner::VMResult;
 use crate::{get_contract_cache_key, imports};
 use memoffset::offset_of;
-use near_primitives::contract::ContractCode;
-use near_primitives::runtime::fees::RuntimeFeesConfig;
-use near_primitives::types::{CompiledContract, CompiledContractCache};
-use near_stable_hasher::StableHasher;
-use near_vm_errors::{
-    CacheError, CompilationError, FunctionCallError, MethodResolveError, VMRunnerError, WasmTrap,
-};
-use near_vm_logic::gas_counter::FastGasCounter;
-use near_vm_logic::types::{PromiseResult, ProtocolVersion};
-use near_vm_logic::{External, MemSlice, MemoryLike, VMConfig, VMContext, VMLogic, VMOutcome};
+use near_primitives_core::contract::ContractCode;
+use near_primitives_core::runtime::fees::RuntimeFeesConfig;
 use std::borrow::Cow;
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 use std::mem::size_of;
 use std::sync::Arc;
 use wasmer_compiler_singlepass::Singlepass;
@@ -24,22 +25,9 @@ use wasmer_engine::{Engine, Executable};
 use wasmer_engine_universal::{
     Universal, UniversalEngine, UniversalExecutable, UniversalExecutableRef,
 };
-use wasmer_types::{Features, FunctionIndex, InstanceConfig, MemoryType, Pages, WASM_PAGE_SIZE};
+use wasmer_types::{FunctionIndex, InstanceConfig, MemoryType, Pages, WASM_PAGE_SIZE};
 use wasmer_vm::{
     Artifact, Instantiatable, LinearMemory, LinearTable, Memory, MemoryStyle, TrapCode, VMMemory,
-};
-
-const WASMER_FEATURES: Features = Features {
-    threads: WASM_FEATURES.threads,
-    reference_types: WASM_FEATURES.reference_types,
-    simd: WASM_FEATURES.simd,
-    bulk_memory: WASM_FEATURES.bulk_memory,
-    multi_value: WASM_FEATURES.multi_value,
-    tail_call: WASM_FEATURES.tail_call,
-    module_linking: WASM_FEATURES.module_linking,
-    multi_memory: WASM_FEATURES.multi_memory,
-    memory64: WASM_FEATURES.memory64,
-    exceptions: WASM_FEATURES.exceptions,
 };
 
 #[derive(Clone)]
@@ -164,7 +152,7 @@ fn translate_runtime_error(
 ) -> Result<FunctionCallError, VMRunnerError> {
     // Errors produced by host function calls also become `RuntimeError`s that wrap a dynamic
     // instance of `VMLogicError` internally. See the implementation of `Wasmer2Imports`.
-    let error = match error.downcast::<near_vm_errors::VMLogicError>() {
+    let error = match error.downcast::<crate::logic::VMLogicError>() {
         Ok(vm_logic) => {
             return vm_logic.try_into();
         }
@@ -222,18 +210,16 @@ struct Wasmer2Config {
 
 impl Wasmer2Config {
     fn config_hash(self: Self) -> u64 {
-        let mut s = StableHasher::new();
-        self.hash(&mut s);
-        s.finish()
+        crate::utils::stable_hash(&self)
     }
 }
 
 // We use following scheme for the bits forming seed:
-//  kind << 10, kind is 1 for Wasmer2
+//  kind << 29, kind is 1 for Wasmer2
 //  major version << 6
 //  minor version
 const WASMER2_CONFIG: Wasmer2Config = Wasmer2Config {
-    seed: (1 << 10) | (9 << 6) | 0,
+    seed: (1 << 29) | (12 << 6) | 0,
     engine: WasmerEngine::Universal,
     compiler: WasmerCompiler::Singlepass,
 };
@@ -256,9 +242,11 @@ impl Wasmer2VM {
         let compiler = Singlepass::new();
         // We only support universal engine at the moment.
         assert_eq!(WASMER2_CONFIG.engine, WasmerEngine::Universal);
+        let features =
+            crate::features::WasmFeatures::from(config.limit_config.contract_prepare_version);
         Self {
             config,
-            engine: Universal::new(compiler).target(target).features(WASMER_FEATURES).engine(),
+            engine: Universal::new(compiler).target(target).features(features.into()).engine(),
         }
     }
 
@@ -286,7 +274,7 @@ impl Wasmer2VM {
         code: &ContractCode,
     ) -> Result<UniversalExecutable, CompilationError> {
         let _span = tracing::debug_span!(target: "vm", "Wasmer2VM::compile_uncached").entered();
-        let prepared_code = prepare::prepare_contract(code.code(), &self.config)
+        let prepared_code = prepare::prepare_contract(code.code(), &self.config, VMKind::Wasmer2)
             .map_err(CompilationError::PrepareError)?;
 
         debug_assert!(
@@ -395,21 +383,7 @@ impl Wasmer2VM {
             })
         };
 
-        #[cfg(feature = "no_cache")]
         return compile_or_read_from_cache();
-
-        #[cfg(not(feature = "no_cache"))]
-        return {
-            static MEM_CACHE: once_cell::sync::Lazy<
-                near_cache::SyncLruCache<
-                    near_primitives::hash::CryptoHash,
-                    Result<VMArtifact, CompilationError>,
-                >,
-            > = once_cell::sync::Lazy::new(|| {
-                near_cache::SyncLruCache::new(crate::cache::CACHE_SIZE)
-            });
-            MEM_CACHE.get_or_try_put(key, |_key| compile_or_read_from_cache())
-        };
     }
 
     fn run_method(
@@ -660,8 +634,10 @@ impl crate::runner::VM for Wasmer2VM {
         &self,
         code: &ContractCode,
         cache: &dyn CompiledContractCache,
-    ) -> Result<Result<ContractPrecompilatonResult, CompilationError>, near_vm_errors::CacheError>
-    {
+    ) -> Result<
+        Result<ContractPrecompilatonResult, CompilationError>,
+        crate::logic::errors::CacheError,
+    > {
         Ok(self
             .compile_and_cache(code, Some(cache))?
             .map(|_| ContractPrecompilatonResult::ContractCompiled))
@@ -670,5 +646,5 @@ impl crate::runner::VM for Wasmer2VM {
 
 #[test]
 fn test_memory_like() {
-    near_vm_logic::test_utils::test_memory_like(|| Box::new(Wasmer2Memory::new(1, 1).unwrap()));
+    crate::logic::test_utils::test_memory_like(|| Box::new(Wasmer2Memory::new(1, 1).unwrap()));
 }

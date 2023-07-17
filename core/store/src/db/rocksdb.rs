@@ -4,7 +4,9 @@ use crate::{metadata, metrics, DBCol, StoreConfig, StoreStatistics, Temperature}
 use ::rocksdb::{
     BlockBasedOptions, Cache, ColumnFamily, Env, IteratorMode, Options, ReadOptions, WriteBatch, DB,
 };
+use once_cell::sync::Lazy;
 use std::io;
+use std::ops::Deref;
 use std::path::Path;
 use strum::IntoEnumIterator;
 use tracing::warn;
@@ -15,8 +17,29 @@ pub(crate) mod snapshot;
 /// List of integer RocskDB properties we’re reading when collecting statistics.
 ///
 /// In the end, they are exported as Prometheus metrics.
-const CF_PROPERTY_NAMES: [&'static std::ffi::CStr; 1] =
-    [::rocksdb::properties::LIVE_SST_FILES_SIZE];
+static CF_PROPERTY_NAMES: Lazy<Vec<std::ffi::CString>> = Lazy::new(|| {
+    use ::rocksdb::properties;
+    let mut ret = Vec::new();
+    ret.extend_from_slice(
+        &[
+            properties::LIVE_SST_FILES_SIZE,
+            properties::ESTIMATE_LIVE_DATA_SIZE,
+            properties::COMPACTION_PENDING,
+            properties::NUM_RUNNING_COMPACTIONS,
+            properties::ESTIMATE_PENDING_COMPACTION_BYTES,
+            properties::ESTIMATE_TABLE_READERS_MEM,
+            properties::BLOCK_CACHE_CAPACITY,
+            properties::BLOCK_CACHE_USAGE,
+            properties::CUR_SIZE_ACTIVE_MEM_TABLE,
+            properties::SIZE_ALL_MEM_TABLES,
+        ]
+        .map(std::ffi::CStr::to_owned),
+    );
+    for level in 0..=6 {
+        ret.push(properties::num_files_at_level(level));
+    }
+    ret
+});
 
 pub struct RocksDB {
     db: DB,
@@ -212,9 +235,9 @@ impl RocksDB {
     fn iter_raw_bytes_internal<'a>(
         &'a self,
         col: DBCol,
-        prefix: Option<&'a [u8]>,
-        lower_bound: Option<&'a [u8]>,
-        upper_bound: Option<&'a [u8]>,
+        prefix: Option<&[u8]>,
+        lower_bound: Option<&[u8]>,
+        upper_bound: Option<&[u8]>,
     ) -> RocksDBIterator<'a> {
         let cf_handle = self.cf_handle(col).unwrap();
         let mut read_options = rocksdb_read_options();
@@ -290,15 +313,15 @@ impl Database for RocksDB {
         Ok(result)
     }
 
-    fn iter_raw_bytes<'a>(&'a self, col: DBCol) -> DBIterator<'a> {
+    fn iter_raw_bytes(&self, col: DBCol) -> DBIterator {
         Box::new(self.iter_raw_bytes_internal(col, None, None, None))
     }
 
-    fn iter<'a>(&'a self, col: DBCol) -> DBIterator<'a> {
+    fn iter(&self, col: DBCol) -> DBIterator {
         refcount::iter_with_rc_logic(col, self.iter_raw_bytes_internal(col, None, None, None))
     }
 
-    fn iter_prefix<'a>(&'a self, col: DBCol, key_prefix: &'a [u8]) -> DBIterator<'a> {
+    fn iter_prefix(&self, col: DBCol, key_prefix: &[u8]) -> DBIterator {
         let iter = self.iter_raw_bytes_internal(col, Some(key_prefix), None, None);
         refcount::iter_with_rc_logic(col, iter)
     }
@@ -306,8 +329,8 @@ impl Database for RocksDB {
     fn iter_range<'a>(
         &'a self,
         col: DBCol,
-        lower_bound: Option<&'a [u8]>,
-        upper_bound: Option<&'a [u8]>,
+        lower_bound: Option<&[u8]>,
+        upper_bound: Option<&[u8]>,
     ) -> DBIterator<'a> {
         let iter = self.iter_raw_bytes_internal(col, None, lower_bound, upper_bound);
         refcount::iter_with_rc_logic(col, iter)
@@ -384,6 +407,14 @@ impl Database for RocksDB {
         } else {
             Some(result)
         }
+    }
+
+    fn create_checkpoint(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        let _span =
+            tracing::info_span!(target: "state_snapshot", "create_checkpoint", ?path).entered();
+        let cp = ::rocksdb::checkpoint::Checkpoint::new(&self.db)?;
+        cp.create_checkpoint(path)?;
+        Ok(())
     }
 }
 
@@ -507,7 +538,7 @@ fn set_compression_options(opts: &mut Options) {
 impl RocksDB {
     /// Blocks until all RocksDB instances (usually 0 or 1) gracefully shutdown.
     pub fn block_until_all_instances_are_dropped() {
-        instance_tracker::block_until_all_instances_are_dropped();
+        instance_tracker::block_until_all_instances_are_closed();
     }
 
     /// Returns metadata of the database or `None` if the db doesn’t exist.
@@ -530,7 +561,7 @@ impl RocksDB {
 
     /// Gets every int property in CF_PROPERTY_NAMES for every column in DBCol.
     fn get_cf_statistics(&self, result: &mut StoreStatistics) {
-        for prop_name in CF_PROPERTY_NAMES {
+        for prop_name in CF_PROPERTY_NAMES.deref() {
             let values = self
                 .cf_handles()
                 .filter_map(|(col, handle)| {
@@ -746,7 +777,7 @@ mod tests {
         let mut result = StoreStatistics { data: vec![] };
         let parse_result = parse_statistics(statistics, &mut result);
         // We should be able to parse stats and the result should be Ok(()).
-        assert_eq!(parse_result.unwrap(), ());
+        parse_result.unwrap();
         assert_eq!(
             result,
             StoreStatistics {

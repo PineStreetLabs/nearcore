@@ -10,8 +10,8 @@ use crate::tcp;
 use crate::testonly::{make_rng, AsSet as _};
 use crate::types::PeerMessage;
 use itertools::Itertools;
+use near_async::time;
 use near_o11y::testonly::init_test_logger;
-use near_primitives::time;
 use near_store::db::TestDB;
 use pretty_assertions::assert_eq;
 use rand::seq::SliceRandom as _;
@@ -80,7 +80,7 @@ async fn broadcast() {
     let mut peer2 =
         pm.start_inbound(chain.clone(), chain.make_config(rng)).await.handshake(clock).await;
     let got2 = peer2.events.recv_until(take_full_sync).await;
-    assert_eq!(got2.accounts_data.as_set(), want.iter().collect());
+    assert_eq!(got2.accounts_data.as_set(), want.iter().collect::<HashSet<_>>());
 
     tracing::info!(target:"test", "Send a mix of new and old data. Only new data should be broadcasted.");
     let msg = SyncAccountsData {

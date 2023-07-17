@@ -2,11 +2,10 @@
 //! implementation, such as: singlepass.
 
 #[macro_use]
-extern crate compiler_test_derive;
+extern crate near_vm_compiler_test_derive;
 
 mod config;
 mod deterministic;
-mod fast_gas_metering;
 mod imports;
 mod issues;
 // mod multi_value_imports;

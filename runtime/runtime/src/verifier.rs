@@ -2,6 +2,7 @@ use near_crypto::key_conversion::is_valid_staking_key;
 use near_primitives::checked_feature;
 use near_primitives::delegate_action::SignedDelegateAction;
 use near_primitives::runtime::config::RuntimeConfig;
+use near_primitives::transaction::DeleteAccountAction;
 use near_primitives::types::{BlockHeight, StorageUsage};
 use near_primitives::version::ProtocolFeature;
 use near_primitives::{
@@ -403,7 +404,7 @@ pub fn validate_action(
         Action::Stake(a) => validate_stake_action(a),
         Action::AddKey(a) => validate_add_key_action(limit_config, a),
         Action::DeleteKey(_) => Ok(()),
-        Action::DeleteAccount(_) => Ok(()),
+        Action::DeleteAccount(a) => validate_delete_action(a),
         Action::Delegate(a) => validate_delegate_action(limit_config, a, current_protocol_version),
     }
 }
@@ -482,8 +483,8 @@ fn validate_add_key_action(
         // Check whether `receiver_id` is a valid account_id. Historically, we
         // allowed arbitrary strings there!
         match limit_config.account_id_validity_rules_version {
-            near_vm_logic::AccountIdValidityRulesVersion::V0 => (),
-            near_vm_logic::AccountIdValidityRulesVersion::V1 => {
+            near_vm_runner::logic::AccountIdValidityRulesVersion::V0 => (),
+            near_vm_runner::logic::AccountIdValidityRulesVersion::V1 => {
                 if let Err(_) = fc.receiver_id.parse::<AccountId>() {
                     return Err(ActionsValidationError::InvalidAccountId {
                         account_id: truncate_string(&fc.receiver_id, AccountId::MAX_LEN * 2),
@@ -511,6 +512,19 @@ fn validate_add_key_action(
                 limit: limit_config.max_number_bytes_method_names,
             });
         }
+    }
+
+    Ok(())
+}
+
+/// Validates `DeleteAction`.
+///
+/// Checks that the `beneficiary_id` is a valid account ID.
+fn validate_delete_action(action: &DeleteAccountAction) -> Result<(), ActionsValidationError> {
+    if AccountId::validate(&action.beneficiary_id).is_err() {
+        return Err(ActionsValidationError::InvalidAccountId {
+            account_id: action.beneficiary_id.to_string(),
+        });
     }
 
     Ok(())
@@ -1186,7 +1200,7 @@ mod tests {
         assert_eq!(
             res,
             RuntimeError::InvalidTxError(InvalidTxError::LackBalanceForState {
-                signer_id: account_id.clone(),
+                signer_id: account_id,
                 amount: Balance::from(account.storage_usage()) * config.storage_amount_per_byte()
                     - (initial_balance - transfer_amount)
             })
@@ -1867,7 +1881,7 @@ mod tests {
                 &VMLimitConfig::test(),
                 &[
                     Action::CreateAccount(CreateAccountAction {}),
-                    Action::Delegate(signed_delegate_action.clone()),
+                    Action::Delegate(signed_delegate_action),
                 ],
                 PROTOCOL_VERSION,
             ),

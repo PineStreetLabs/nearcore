@@ -1,5 +1,6 @@
+extern crate core;
+
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -12,11 +13,13 @@ use strum;
 
 pub use columns::DBCol;
 pub use db::{
-    CHUNK_TAIL_KEY, COLD_HEAD_KEY, FINAL_HEAD_KEY, FORK_TAIL_KEY, HEADER_HEAD_KEY, HEAD_KEY,
-    LARGEST_TARGET_HEIGHT_KEY, LATEST_KNOWN_KEY, TAIL_KEY,
+    CHUNK_TAIL_KEY, COLD_HEAD_KEY, FINAL_HEAD_KEY, FORK_TAIL_KEY, GENESIS_JSON_HASH_KEY,
+    GENESIS_STATE_ROOTS_KEY, HEADER_HEAD_KEY, HEAD_KEY, LARGEST_TARGET_HEIGHT_KEY,
+    LATEST_KNOWN_KEY, STATE_SYNC_DUMP_KEY, TAIL_KEY,
 };
+pub use genesis_state_applier::GenesisStateApplier;
 use near_crypto::PublicKey;
-use near_o11y::pretty;
+use near_fmt::{AbbrBytes, StorageKey};
 use near_primitives::account::{AccessKey, Account};
 use near_primitives::contract::ContractCode;
 pub use near_primitives::errors::StorageError;
@@ -24,19 +27,17 @@ use near_primitives::hash::CryptoHash;
 use near_primitives::receipt::{DelayedReceiptIndices, Receipt, ReceivedData};
 pub use near_primitives::shard_layout::ShardUId;
 use near_primitives::trie_key::{trie_key_parsers, TrieKey};
-use near_primitives::types::{AccountId, CompiledContract, CompiledContractCache, StateRoot};
+use near_primitives::types::{AccountId, StateRoot};
+use near_vm_runner::logic::{CompiledContract, CompiledContractCache};
 
-use crate::db::{
-    refcount, DBIterator, DBOp, DBSlice, DBTransaction, Database, StoreStatistics,
-    GENESIS_JSON_HASH_KEY, GENESIS_STATE_ROOTS_KEY,
-};
+use crate::db::{refcount, DBIterator, DBOp, DBSlice, DBTransaction, Database, StoreStatistics};
 pub use crate::trie::iterator::{TrieIterator, TrieTraversalItem};
 pub use crate::trie::update::{TrieUpdate, TrieUpdateIterator, TrieUpdateValuePtr};
 pub use crate::trie::{
     estimator, split_state, ApplyStatePartResult, KeyForStateChanges, KeyLookupMode, NibbleSlice,
-    PartialStorage, PrefetchApi, PrefetchError, RawTrieNode, RawTrieNodeWithSize, ShardTries, Trie,
-    TrieAccess, TrieCache, TrieCachingStorage, TrieChanges, TrieConfig, TrieDBStorage, TrieStorage,
-    WrappedTrieChanges,
+    PartialStorage, PrefetchApi, PrefetchError, RawTrieNode, RawTrieNodeWithSize, ShardTries,
+    StateSnapshot, StateSnapshotConfig, Trie, TrieAccess, TrieCache, TrieCachingStorage,
+    TrieChanges, TrieConfig, TrieDBStorage, TrieStorage, WrappedTrieChanges,
 };
 
 pub mod cold_storage;
@@ -44,16 +45,21 @@ mod columns;
 pub mod config;
 pub mod db;
 pub mod flat;
+pub mod genesis;
+pub mod genesis_state_applier;
 pub mod metadata;
-mod metrics;
+pub mod metrics;
 pub mod migrations;
 mod opener;
+mod rocksdb_metrics;
 mod sync_utils;
 pub mod test_utils;
-mod trie;
+pub mod trie;
 
 pub use crate::config::{Mode, StoreConfig};
-pub use crate::opener::{StoreMigrator, StoreOpener, StoreOpenerError};
+pub use crate::opener::{
+    checkpoint_hot_storage_and_cleanup_columns, StoreMigrator, StoreOpener, StoreOpenerError,
+};
 
 /// Specifies temperature of a storage.
 ///
@@ -80,10 +86,7 @@ impl FromStr for Temperature {
     }
 }
 
-#[cfg(feature = "protocol_feature_flat_state")]
 const STATE_COLUMNS: [DBCol; 2] = [DBCol::State, DBCol::FlatState];
-#[cfg(not(feature = "protocol_feature_flat_state"))]
-const STATE_COLUMNS: [DBCol; 1] = [DBCol::State];
 const STATE_FILE_END_MARK: u8 = 255;
 
 /// Node’s storage holding chain and all other necessary data.
@@ -280,7 +283,7 @@ impl Store {
             target: "store",
             db_op = "get",
             col = %column,
-            key = %pretty::StorageKey(key),
+            key = %StorageKey(key),
             size = value.as_deref().map(<[u8]>::len)
         );
         Ok(value)
@@ -320,8 +323,8 @@ impl Store {
     pub fn iter_range<'a>(
         &'a self,
         col: DBCol,
-        lower_bound: Option<&'a [u8]>,
-        upper_bound: Option<&'a [u8]>,
+        lower_bound: Option<&[u8]>,
+        upper_bound: Option<&[u8]>,
     ) -> DBIterator<'a> {
         self.storage.iter_range(col, lower_bound, upper_bound)
     }
@@ -344,20 +347,16 @@ impl Store {
     /// `STATE_COLUMNS` array.
     pub fn save_state_to_file(&self, filename: &Path) -> io::Result<()> {
         let file = File::create(filename)?;
-        let mut file = BufWriter::new(file);
+        let mut file = std::io::BufWriter::new(file);
         for (column_index, &column) in STATE_COLUMNS.iter().enumerate() {
             assert!(column_index < STATE_FILE_END_MARK.into());
-            let column_index = column_index.try_into().unwrap();
+            let column_index: u8 = column_index.try_into().unwrap();
             for item in self.storage.iter_raw_bytes(column) {
                 let (key, value) = item?;
-                file.write_all(&[column_index])?;
-                file.write_all(&u32::try_from(key.len()).unwrap().to_le_bytes())?;
-                file.write_all(&key)?;
-                file.write_all(&u32::try_from(value.len()).unwrap().to_le_bytes())?;
-                file.write_all(&value)?;
+                (column_index, key, value).serialize(&mut file)?;
             }
         }
-        file.write_all(&[STATE_FILE_END_MARK])
+        STATE_FILE_END_MARK.serialize(&mut file)
     }
 
     /// Loads state (`State` and `FlatState` columns) from given file.
@@ -365,29 +364,17 @@ impl Store {
     /// See [`Self::save_state_to_file`] for description of the file format.
     pub fn load_state_from_file(&self, filename: &Path) -> io::Result<()> {
         let file = File::open(filename)?;
-        let mut file = BufReader::new(file);
+        let mut file = std::io::BufReader::new(file);
         let mut transaction = DBTransaction::new();
         loop {
-            let mut column_index = [0u8; 1];
-            file.read_exact(&mut column_index)?;
-            if column_index[0] == STATE_FILE_END_MARK {
+            let column = u8::deserialize_reader(&mut file)?;
+            if column == STATE_FILE_END_MARK {
                 break;
             }
-            let column = STATE_COLUMNS[column_index[0] as usize];
-            let key = Self::read_vec(&mut file)?;
-            let value = Self::read_vec(&mut file)?;
-            transaction.set(column, key, value);
+            let (key, value) = BorshDeserialize::deserialize_reader(&mut file)?;
+            transaction.set(STATE_COLUMNS[usize::from(column)], key, value);
         }
         self.storage.write(transaction)
-    }
-
-    fn read_vec(rd: &mut impl io::BufRead) -> io::Result<Vec<u8>> {
-        let mut bytes = [0; 4];
-        rd.read_exact(&mut bytes)?;
-        // TODO(mina86): Use read_buf_exact once read_buf stabilises.
-        let mut vec = vec![0; u32::from_le_bytes(bytes) as usize];
-        rd.read_exact(&mut vec)?;
-        Ok(vec)
     }
 
     /// If the storage is backed by disk, flushes any in-memory data to disk.
@@ -430,12 +417,7 @@ impl Store {
 /// Keeps track of current changes to the database and can commit all of them to the database.
 pub struct StoreUpdate {
     transaction: DBTransaction,
-    storage: StoreUpdateStorage,
-}
-
-enum StoreUpdateStorage {
-    DB(Arc<dyn Database>),
-    Tries(ShardTries),
+    storage: Arc<dyn Database>,
 }
 
 impl StoreUpdate {
@@ -445,11 +427,7 @@ impl StoreUpdate {
     };
 
     pub(crate) fn new(db: Arc<dyn Database>) -> Self {
-        StoreUpdate { transaction: DBTransaction::new(), storage: StoreUpdateStorage::DB(db) }
-    }
-
-    pub fn new_with_tries(tries: ShardTries) -> Self {
-        StoreUpdate { transaction: DBTransaction::new(), storage: StoreUpdateStorage::Tries(tries) }
+        StoreUpdate { transaction: DBTransaction::new(), storage: db }
     }
 
     /// Inserts a new value into the database.
@@ -580,52 +558,12 @@ impl StoreUpdate {
         self.transaction.delete_range(column, from.to_vec(), to.to_vec());
     }
 
-    /// Sets reference to the trie to clear cache on the commit.
-    ///
-    /// Panics if shard_tries are already set to a different object.
-    fn set_shard_tries(&mut self, tries: &ShardTries) {
-        assert!(self.check_compatible_shard_tries(tries));
-        self.storage = StoreUpdateStorage::Tries(tries.clone())
-    }
-
     /// Merge another store update into this one.
     ///
     /// Panics if `self`’s and `other`’s storage are incompatible.
     pub fn merge(&mut self, other: StoreUpdate) {
-        match other.storage {
-            StoreUpdateStorage::Tries(tries) => {
-                assert!(self.check_compatible_shard_tries(&tries));
-                self.storage = StoreUpdateStorage::Tries(tries);
-            }
-            StoreUpdateStorage::DB(other_db) => {
-                let self_db = match &self.storage {
-                    StoreUpdateStorage::Tries(tries) => tries.get_db(),
-                    StoreUpdateStorage::DB(db) => &db,
-                };
-                assert!(same_db(self_db, &other_db));
-            }
-        }
+        assert!(same_db(&self.storage, &other.storage));
         self.transaction.merge(other.transaction)
-    }
-
-    /// Verifies that given shard tries are compatible with this object.
-    ///
-    /// The [`ShardTries`] object is compatible if a) this object’s storage is
-    /// a database which is the same as tries’ one or b) this object’s storage
-    /// is the given shard tries.
-    fn check_compatible_shard_tries(&self, tries: &ShardTries) -> bool {
-        match &self.storage {
-            StoreUpdateStorage::DB(db) => same_db(&db, tries.get_db()),
-            StoreUpdateStorage::Tries(our) => our.is_same(tries),
-        }
-    }
-
-    pub fn update_cache(&self) -> io::Result<()> {
-        if let StoreUpdateStorage::Tries(tries) = &self.storage {
-            tries.update_cache(&self.transaction)
-        } else {
-            Ok(())
-        }
     }
 
     pub fn commit(self) -> io::Result<()> {
@@ -654,33 +592,26 @@ impl StoreUpdate {
         for op in &self.transaction.ops {
             match op {
                 DBOp::Insert { col, key, value } => {
-                    tracing::trace!(target: "store", db_op = "insert", col = %col, key = %pretty::StorageKey(key), size = value.len(), value = %pretty::AbbrBytes(value),)
+                    tracing::trace!(target: "store", db_op = "insert", col = %col, key = %StorageKey(key), size = value.len(), value = %AbbrBytes(value),)
                 }
                 DBOp::Set { col, key, value } => {
-                    tracing::trace!(target: "store", db_op = "set", col = %col, key = %pretty::StorageKey(key), size = value.len(), value = %pretty::AbbrBytes(value))
+                    tracing::trace!(target: "store", db_op = "set", col = %col, key = %StorageKey(key), size = value.len(), value = %AbbrBytes(value))
                 }
                 DBOp::UpdateRefcount { col, key, value } => {
-                    tracing::trace!(target: "store", db_op = "update_rc", col = %col, key = %pretty::StorageKey(key), size = value.len(), value = %pretty::AbbrBytes(value))
+                    tracing::trace!(target: "store", db_op = "update_rc", col = %col, key = %StorageKey(key), size = value.len(), value = %AbbrBytes(value))
                 }
                 DBOp::Delete { col, key } => {
-                    tracing::trace!(target: "store", db_op = "delete", col = %col, key = %pretty::StorageKey(key))
+                    tracing::trace!(target: "store", db_op = "delete", col = %col, key = %StorageKey(key))
                 }
                 DBOp::DeleteAll { col } => {
                     tracing::trace!(target: "store", db_op = "delete_all", col = %col)
                 }
                 DBOp::DeleteRange { col, from, to } => {
-                    tracing::trace!(target: "store", db_op = "delete_range", col = %col, from = %pretty::StorageKey(from), to = %pretty::StorageKey(to))
+                    tracing::trace!(target: "store", db_op = "delete_range", col = %col, from = %StorageKey(from), to = %StorageKey(to))
                 }
             }
         }
-        let storage = match &self.storage {
-            StoreUpdateStorage::Tries(tries) => {
-                tries.update_cache(&self.transaction)?;
-                tries.get_db()
-            }
-            StoreUpdateStorage::DB(db) => &db,
-        };
-        storage.write(self.transaction)
+        self.storage.write(self.transaction)
     }
 }
 
@@ -696,21 +627,16 @@ impl fmt::Debug for StoreUpdate {
         writeln!(f, "Store Update {{")?;
         for op in self.transaction.ops.iter() {
             match op {
-                DBOp::Insert { col, key, .. } => {
-                    writeln!(f, "  + {col} {}", pretty::StorageKey(key))?
-                }
-                DBOp::Set { col, key, .. } => writeln!(f, "  = {col} {}", pretty::StorageKey(key))?,
+                DBOp::Insert { col, key, .. } => writeln!(f, "  + {col} {}", StorageKey(key))?,
+                DBOp::Set { col, key, .. } => writeln!(f, "  = {col} {}", StorageKey(key))?,
                 DBOp::UpdateRefcount { col, key, .. } => {
-                    writeln!(f, "  ± {col} {}", pretty::StorageKey(key))?
+                    writeln!(f, "  ± {col} {}", StorageKey(key))?
                 }
-                DBOp::Delete { col, key } => writeln!(f, "  - {col} {}", pretty::StorageKey(key))?,
+                DBOp::Delete { col, key } => writeln!(f, "  - {col} {}", StorageKey(key))?,
                 DBOp::DeleteAll { col } => writeln!(f, "  - {col} (all)")?,
-                DBOp::DeleteRange { col, from, to } => writeln!(
-                    f,
-                    "  - {col} [{}, {})",
-                    pretty::StorageKey(from),
-                    pretty::StorageKey(to)
-                )?,
+                DBOp::DeleteRange { col, from, to } => {
+                    writeln!(f, "  - {col} [{}, {})", StorageKey(from), StorageKey(to))?
+                }
             }
         }
         writeln!(f, "}}")
@@ -797,6 +723,23 @@ pub fn get_delayed_receipt_indices(
     trie: &dyn TrieAccess,
 ) -> Result<DelayedReceiptIndices, StorageError> {
     Ok(get(trie, &TrieKey::DelayedReceiptIndices)?.unwrap_or_default())
+}
+
+// Adds the given receipt into the end of the delayed receipt queue in the state.
+pub fn set_delayed_receipt(
+    state_update: &mut TrieUpdate,
+    delayed_receipts_indices: &mut DelayedReceiptIndices,
+    receipt: &Receipt,
+) {
+    set(
+        state_update,
+        TrieKey::DelayedReceipt { index: delayed_receipts_indices.next_available_index },
+        receipt,
+    );
+    delayed_receipts_indices.next_available_index = delayed_receipts_indices
+        .next_available_index
+        .checked_add(1)
+        .expect("Next available index for delayed receipt exceeded the integer limit");
 }
 
 pub fn set_access_key(
@@ -1069,7 +1012,7 @@ mod tests {
     /// Check StoreCompiledContractCache implementation.
     #[test]
     fn test_store_compiled_contract_cache() {
-        use near_primitives::types::{CompiledContract, CompiledContractCache};
+        use near_vm_runner::logic::{CompiledContract, CompiledContractCache};
         use std::str::FromStr;
 
         let store = crate::test_utils::create_test_store();
@@ -1080,7 +1023,7 @@ mod tests {
         assert_eq!(false, cache.has(&key).unwrap());
 
         let record = CompiledContract::Code(b"foo".to_vec());
-        assert_eq!((), cache.put(&key, record.clone()).unwrap());
+        cache.put(&key, record.clone()).unwrap();
         assert_eq!(Some(record), cache.get(&key).unwrap());
         assert_eq!(true, cache.has(&key).unwrap());
     }
@@ -1142,7 +1085,7 @@ mod tests {
         core::mem::drop(file);
         let store = crate::test_utils::create_test_store();
         assert_eq!(
-            std::io::ErrorKind::UnexpectedEof,
+            std::io::ErrorKind::InvalidInput,
             store.load_state_from_file(tmp.path()).unwrap_err().kind()
         );
     }

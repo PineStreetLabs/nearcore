@@ -1,13 +1,12 @@
 use crate::errors::ContractPrecompilatonResult;
+use crate::logic::errors::{CacheError, CompilationError, VMRunnerError};
+use crate::logic::types::PromiseResult;
+use crate::logic::{CompiledContractCache, External, VMContext, VMOutcome};
 use crate::vm_kind::VMKind;
-use near_primitives::config::VMConfig;
-use near_primitives::contract::ContractCode;
-use near_primitives::runtime::fees::RuntimeFeesConfig;
-use near_primitives::types::CompiledContractCache;
-use near_primitives::version::ProtocolVersion;
-use near_vm_errors::{CacheError, CompilationError, VMRunnerError};
-use near_vm_logic::types::PromiseResult;
-use near_vm_logic::{External, VMContext, VMOutcome};
+use near_primitives_core::config::VMConfig;
+use near_primitives_core::contract::ContractCode;
+use near_primitives_core::runtime::fees::RuntimeFeesConfig;
+use near_primitives_core::types::ProtocolVersion;
 
 /// Returned by VM::run method.
 ///
@@ -61,6 +60,7 @@ pub fn run(
         %method_name,
         ?vm_kind,
         burnt_gas = tracing::field::Empty,
+        %current_protocol_version,
     )
     .entered();
 
@@ -136,6 +136,8 @@ impl VMKind {
             Self::Wasmtime => Some(Box::new(crate::wasmtime_runner::WasmtimeVM::new(config))),
             #[cfg(all(feature = "wasmer2_vm", target_arch = "x86_64"))]
             Self::Wasmer2 => Some(Box::new(crate::wasmer2_runner::Wasmer2VM::new(config))),
+            #[cfg(all(feature = "near_vm", target_arch = "x86_64"))]
+            Self::NearVm => Some(Box::new(crate::near_vm_runner::NearVM::new(config))),
             #[allow(unreachable_patterns)] // reachable when some of the VMs are disabled.
             _ => None,
         }

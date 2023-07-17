@@ -578,6 +578,7 @@ pub unsafe fn recurse() {
 /// Rust compiler is getting smarter and starts to optimize my deep recursion.
 /// We're going to fight it with a more obscure implementations.
 #[no_mangle]
+#[inline(never)]
 fn internal_recurse(n: u64) -> u64 {
     if n <= 1 {
         n
@@ -608,7 +609,8 @@ fn log_u64(msg: u64) {
 }
 
 pub fn from_base64(s: &str) -> Vec<u8> {
-    base64::decode(s).unwrap()
+    let engine = &base64::engine::general_purpose::STANDARD;
+    base64::Engine::decode(engine, s).unwrap()
 }
 
 #[no_mangle]

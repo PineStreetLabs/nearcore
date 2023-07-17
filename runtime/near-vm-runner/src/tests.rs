@@ -1,15 +1,18 @@
 mod cache;
 mod compile_errors;
 mod fuzzers;
+mod regression_tests;
 mod rs_contract;
 mod runtime_errors;
 pub(crate) mod test_builder;
 mod ts_contract;
 mod wasm_validation;
 
+use crate::logic::{VMConfig, VMContext};
 use crate::vm_kind::VMKind;
-use near_primitives::version::ProtocolVersion;
-use near_vm_logic::VMContext;
+#[cfg(all(feature = "near_vm", target_arch = "x86_64"))]
+use near_primitives_core::config::ContractPrepareVersion;
+use near_primitives_core::types::ProtocolVersion;
 
 const CURRENT_ACCOUNT_ID: &str = "alice";
 const SIGNER_ACCOUNT_ID: &str = "bob";
@@ -18,7 +21,7 @@ const PREDECESSOR_ACCOUNT_ID: &str = "carol";
 
 const LATEST_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::MAX;
 
-fn with_vm_variants(runner: fn(VMKind) -> ()) {
+pub(crate) fn with_vm_variants(#[allow(unused)] cfg: &VMConfig, runner: impl Fn(VMKind) -> ()) {
     #[cfg(all(feature = "wasmer0_vm", target_arch = "x86_64"))]
     runner(VMKind::Wasmer0);
 
@@ -27,6 +30,11 @@ fn with_vm_variants(runner: fn(VMKind) -> ()) {
 
     #[cfg(all(feature = "wasmer2_vm", target_arch = "x86_64"))]
     runner(VMKind::Wasmer2);
+
+    #[cfg(all(feature = "near_vm", target_arch = "x86_64"))]
+    if cfg.limit_config.contract_prepare_version == ContractPrepareVersion::V2 {
+        runner(VMKind::NearVm);
+    }
 }
 
 fn create_context(input: Vec<u8>) -> VMContext {

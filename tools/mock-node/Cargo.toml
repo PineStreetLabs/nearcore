@@ -1,9 +1,12 @@
 [package]
 name = "mock-node"
-version = "0.0.0"
+version.workspace = true
 authors.workspace = true
-publish = false
 edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false
 
 [dependencies]
 actix-rt.workspace = true
@@ -11,6 +14,7 @@ actix.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 futures.workspace = true
+pin-project.workspace = true
 rand.workspace = true
 rayon.workspace = true
 serde.workspace = true
@@ -28,6 +32,7 @@ near-crypto.workspace = true
 near-chunks.workspace = true
 near-epoch-manager.workspace = true
 near-jsonrpc.workspace = true
+near-jsonrpc-client.workspace = true
 near-network.workspace = true
 near-store.workspace = true
 near-o11y.workspace = true
@@ -45,5 +50,4 @@ required-features = ["mock_node"]
 
 [features]
 test_features = ["nearcore/test_features"]
-protocol_feature_flat_state = ["nearcore/protocol_feature_flat_state"]
 mock_node = ["near-chain/mock_node", "near-epoch-manager/mock_node"]

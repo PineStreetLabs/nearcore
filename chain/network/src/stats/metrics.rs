@@ -2,6 +2,7 @@ use crate::network_protocol::Encoding;
 use crate::network_protocol::{RoutedMessageBody, RoutedMessageV2};
 use crate::tcp;
 use crate::types::PeerType;
+use near_async::time;
 use near_o11y::metrics::prometheus;
 use near_o11y::metrics::{
     exponential_buckets, try_create_histogram, try_create_histogram_vec,
@@ -9,7 +10,6 @@ use near_o11y::metrics::{
     try_create_int_gauge, try_create_int_gauge_vec, Histogram, HistogramVec, IntCounter,
     IntCounterVec, IntGauge, IntGaugeVec, MetricVec, MetricVecBuilder,
 };
-use near_primitives::time;
 use once_cell::sync::Lazy;
 
 /// Labels represents a schema of an IntGaugeVec metric.
@@ -165,14 +165,6 @@ pub(crate) static PEER_MESSAGE_RECEIVED_BY_TYPE_BYTES: Lazy<IntCounterVec> = Laz
         "near_peer_message_received_by_type_bytes",
         "Total data received from peers by message types",
         &["type"],
-    )
-    .unwrap()
-});
-// TODO(mina86): This has been deprecated in 1.30.  Remove at 1.32 or so.
-pub(crate) static PEER_MESSAGE_RECEIVED_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
-    try_create_int_counter(
-        "near_peer_message_received_total",
-        "Deprecated; aggregate near_peer_message_received_by_type_total instead",
     )
     .unwrap()
 });

@@ -1,11 +1,12 @@
 [package]
 name = "near-mainnet-res"
-version = "0.0.0"
+version.workspace = true
 authors.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
 publish = false
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 serde_json.workspace = true
@@ -13,3 +14,14 @@ serde_json.workspace = true
 near-account-id.workspace = true
 near-chain-configs.workspace = true
 near-primitives.workspace = true
+
+[features]
+nightly = [
+  "nightly_protocol",
+  "near-chain-configs/nightly",
+  "near-primitives/nightly",
+]
+nightly_protocol = [
+  "near-chain-configs/nightly_protocol",
+  "near-primitives/nightly_protocol",
+]

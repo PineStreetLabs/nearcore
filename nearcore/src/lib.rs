@@ -1,21 +1,28 @@
-use crate::cold_storage::spawn_cold_store_loop;
 pub use crate::config::{init_configs, load_config, load_test_config, NearConfig, NEAR_BASE};
+use crate::metrics::spawn_trie_metrics_loop;
 pub use crate::runtime::NightshadeRuntime;
+
+use crate::cold_storage::spawn_cold_store_loop;
 use crate::state_sync::{spawn_state_sync_dump, StateSyncDumpHandle};
 use actix::{Actor, Addr};
 use actix_rt::ArbiterHandle;
-use actix_web;
 use anyhow::Context;
 use cold_storage::ColdStoreLoopHandle;
 use near_async::actix::AddrWithAutoSpanContextExt;
 use near_async::messaging::{IntoSender, LateBoundSender};
+use near_async::time;
+use near_chain::state_snapshot_actor::{get_make_snapshot_callback, StateSnapshotActor};
+use near_chain::types::RuntimeAdapter;
 use near_chain::{Chain, ChainGenesis};
 use near_chunks::shards_manager_actor::start_shards_manager;
 use near_client::{start_client, start_view_client, ClientActor, ConfigUpdater, ViewClientActor};
+use near_epoch_manager::shard_tracker::{ShardTracker, TrackedConfig};
+use near_epoch_manager::EpochManager;
 use near_network::PeerManagerActor;
 use near_primitives::block::GenesisId;
-use near_primitives::time;
+use near_store::flat::FlatStateValuesInliningMigrationHandle;
 use near_store::metadata::DbKind;
+use near_store::metrics::spawn_db_metrics_loop;
 use near_store::{DBCol, Mode, NodeStorage, Store, StoreOpenerError};
 use near_telemetry::TelemetryActor;
 use std::path::{Path, PathBuf};
@@ -24,7 +31,7 @@ use tokio::sync::broadcast;
 use tracing::info;
 
 pub mod append_only_map;
-mod cold_storage;
+pub mod cold_storage;
 pub mod config;
 mod config_validate;
 mod download_file;
@@ -32,7 +39,7 @@ pub mod dyn_config;
 mod metrics;
 pub mod migrations;
 mod runtime;
-mod state_sync;
+pub mod state_sync;
 
 pub fn get_default_home() -> PathBuf {
     if let Ok(near_home) = std::env::var("NEAR_HOME") {
@@ -58,7 +65,7 @@ pub fn get_default_home() -> PathBuf {
 /// The end goal is to get rid of `archive` option in `config.json` file and
 /// have the type of the node be determined purely based on kind of database
 /// being opened.
-fn open_storage(home_dir: &Path, near_config: &mut NearConfig) -> anyhow::Result<NodeStorage> {
+pub fn open_storage(home_dir: &Path, near_config: &mut NearConfig) -> anyhow::Result<NodeStorage> {
     let migrator = migrations::Migrator::new(near_config);
     let opener = NodeStorage::opener(
         home_dir,
@@ -138,13 +145,16 @@ fn open_storage(home_dir: &Path, near_config: &mut NearConfig) -> anyhow::Result
                  {latest_release} release"
             ))
         },
-        Err(StoreOpenerError::DbVersionTooNew { got, .. }) => {
+        Err(StoreOpenerError::DbVersionTooNew { got, want }) => {
             Err(anyhow::anyhow!(
-                "Database version {got} is created by a newer version of \
-                 neard, please update neard"
+                "Database version {got} is higher than the expected version {want}. \
+                It was likely created by newer version of neard. Please upgrade your neard."
             ))
         },
         Err(StoreOpenerError::MigrationError(err)) => {
+            Err(err)
+        },
+        Err(StoreOpenerError::CheckpointError(err)) => {
             Err(err)
         },
     }.with_context(|| format!("unable to open database at {}", opener.path().display()))?;
@@ -190,6 +200,9 @@ pub struct NearNode {
     pub cold_store_loop_handle: Option<ColdStoreLoopHandle>,
     /// Contains handles to background threads that may be dumping state to S3.
     pub state_sync_dump_handle: Option<StateSyncDumpHandle>,
+    /// A handle to control background flat state values inlining migration.
+    /// Needed temporarily, will be removed after the migration is completed.
+    pub flat_state_migration_handle: Option<FlatStateValuesInliningMigrationHandle>,
 }
 
 pub fn start_with_config(home_dir: &Path, config: NearConfig) -> anyhow::Result<NearNode> {
@@ -204,24 +217,60 @@ pub fn start_with_config_and_synchronization(
     shutdown_signal: Option<broadcast::Sender<()>>,
     config_updater: Option<ConfigUpdater>,
 ) -> anyhow::Result<NearNode> {
-    let store = open_storage(home_dir, &mut config)?;
-
-    let runtime = NightshadeRuntime::from_config(home_dir, store.get_hot_store(), &config);
-
-    // Get the split store. If split store is some then create a new runtime for
-    // the view client. Otherwise just re-use the existing runtime.
-    let split_store = get_split_store(&config, &store)?;
-    let view_runtime = if let Some(split_store) = split_store {
-        NightshadeRuntime::from_config(home_dir, split_store, &config)
+    let storage = open_storage(home_dir, &mut config)?;
+    let db_metrics_arbiter = if config.client_config.enable_statistics_export {
+        let period = config.client_config.log_summary_period;
+        let db_metrics_arbiter_handle = spawn_db_metrics_loop(&storage, period)?;
+        Some(db_metrics_arbiter_handle)
     } else {
-        runtime.clone()
+        None
     };
 
-    let cold_store_loop_handle = spawn_cold_store_loop(&config, &store, runtime.clone())?;
+    let trie_metrics_arbiter = spawn_trie_metrics_loop(
+        config.clone(),
+        storage.get_hot_store(),
+        config.client_config.log_summary_period,
+    )?;
+
+    let epoch_manager =
+        EpochManager::new_arc_handle(storage.get_hot_store(), &config.genesis.config);
+    let shard_tracker =
+        ShardTracker::new(TrackedConfig::from_config(&config.client_config), epoch_manager.clone());
+    let runtime = NightshadeRuntime::from_config(
+        home_dir,
+        storage.get_hot_store(),
+        &config,
+        epoch_manager.clone(),
+    );
+
+    // Get the split store. If split store is some then create a new set of structures for
+    // the view client. Otherwise just re-use the existing ones.
+    let split_store = get_split_store(&config, &storage)?;
+    let (view_epoch_manager, view_shard_tracker, view_runtime) =
+        if let Some(split_store) = &split_store {
+            let view_epoch_manager =
+                EpochManager::new_arc_handle(split_store.clone(), &config.genesis.config);
+            let view_shard_tracker = ShardTracker::new(
+                TrackedConfig::from_config(&config.client_config),
+                epoch_manager.clone(),
+            );
+            let view_runtime = NightshadeRuntime::from_config(
+                home_dir,
+                split_store.clone(),
+                &config,
+                view_epoch_manager.clone(),
+            );
+            (view_epoch_manager, view_shard_tracker, view_runtime)
+        } else {
+            (epoch_manager.clone(), shard_tracker.clone(), runtime.clone())
+        };
+
+    let cold_store_loop_handle = spawn_cold_store_loop(&config, &storage, epoch_manager.clone())?;
 
     let telemetry = TelemetryActor::new(config.telemetry_config.clone()).start();
     let chain_genesis = ChainGenesis::new(&config.genesis);
-    let genesis_block = Chain::make_genesis_block(&*runtime, &chain_genesis)?;
+    let genesis_block =
+        Chain::make_genesis_block(epoch_manager.as_ref(), runtime.as_ref(), &chain_genesis)?;
     let genesis_id = GenesisId {
         chain_id: config.client_config.chain_id.clone(),
         hash: *genesis_block.header().hash(),
@@ -233,50 +282,92 @@ pub fn start_with_config_and_synchronization(
     let client_adapter_for_shards_manager = Arc::new(LateBoundSender::default());
     let adv = near_client::adversarial::Controls::new(config.client_config.archive);
 
+    let state_snapshot_actor = if config.config.store.state_snapshot_enabled {
+        runtime.get_flat_storage_manager().map(|flat_storage_manager| {
+            Arc::new(StateSnapshotActor::new(flat_storage_manager, runtime.get_tries()).start())
+        })
+    } else {
+        None
+    };
+
     let view_client = start_view_client(
         config.validator_signer.as_ref().map(|signer| signer.validator_id().clone()),
         chain_genesis.clone(),
+        view_epoch_manager,
+        view_shard_tracker,
         view_runtime,
         network_adapter.clone().into(),
         config.client_config.clone(),
         adv.clone(),
     );
+    let make_state_snapshot_callback =
+        if let (Some(flat_storage_manager), Some(state_snapshot_actor)) =
+            (runtime.get_flat_storage_manager(), state_snapshot_actor)
+        {
+            Some(get_make_snapshot_callback(
+                state_snapshot_actor,
+                flat_storage_manager,
+                config.config.store.state_snapshot_compaction_enabled,
+            ))
+        } else {
+            None
+        };
     let (client_actor, client_arbiter_handle) = start_client(
         config.client_config.clone(),
         chain_genesis.clone(),
+        epoch_manager.clone(),
+        shard_tracker.clone(),
         runtime.clone(),
         node_id,
         network_adapter.clone().into(),
         shards_manager_adapter.as_sender(),
         config.validator_signer.clone(),
         telemetry,
+        make_state_snapshot_callback,
         shutdown_signal,
         adv,
         config_updater,
     );
     client_adapter_for_shards_manager.bind(client_actor.clone().with_auto_span_context());
     let (shards_manager_actor, shards_manager_arbiter_handle) = start_shards_manager(
-        runtime.clone(),
+        epoch_manager.clone(),
+        shard_tracker.clone(),
         network_adapter.as_sender(),
         client_adapter_for_shards_manager.as_sender(),
         config.validator_signer.as_ref().map(|signer| signer.validator_id().clone()),
-        store.get_hot_store(),
+        split_store.unwrap_or(storage.get_hot_store()),
         config.client_config.chunk_request_retry_period,
     );
     shards_manager_adapter.bind(shards_manager_actor);
 
+    let flat_state_migration_handle =
+        if let Some(flat_storage_manager) = runtime.get_flat_storage_manager() {
+            let handle = FlatStateValuesInliningMigrationHandle::start_background_migration(
+                storage.get_hot_store(),
+                flat_storage_manager,
+                config.client_config.client_background_migration_threads,
+            );
+            Some(handle)
+        } else {
+            None
+        };
+
+    let credentials_file = config.config.s3_credentials_file;
     let state_sync_dump_handle = spawn_state_sync_dump(
-        &config,
+        &config.client_config,
         chain_genesis,
+        epoch_manager,
+        shard_tracker,
         runtime,
-        config.network_config.node_id().public_key(),
+        config.validator_signer.as_ref().map(|signer| signer.validator_id().clone()),
+        credentials_file.map(|filename| home_dir.join(filename)),
     )?;
 
     #[allow(unused_mut)]
     let mut rpc_servers = Vec::new();
     let network_actor = PeerManagerActor::spawn(
         time::Clock::real(),
-        store.into_inner(near_store::Temperature::Hot),
+        storage.into_inner(near_store::Temperature::Hot),
         config.network_config,
         Arc::new(near_client::adapter::Adapter::new(client_actor.clone(), view_client.clone())),
         shards_manager_adapter.as_sender(),
@@ -314,13 +405,20 @@ pub fn start_with_config_and_synchronization(
 
     tracing::trace!(target: "diagnostic", key = "log", "Starting NEAR node with diagnostic activated");
 
+    let mut arbiters =
+        vec![client_arbiter_handle, shards_manager_arbiter_handle, trie_metrics_arbiter];
+    if let Some(db_metrics_arbiter) = db_metrics_arbiter {
+        arbiters.push(db_metrics_arbiter);
+    }
+
     Ok(NearNode {
         client: client_actor,
         view_client,
         rpc_servers,
-        arbiters: vec![client_arbiter_handle, shards_manager_arbiter_handle],
+        arbiters,
         cold_store_loop_handle,
         state_sync_dump_handle,
+        flat_state_migration_handle,
     })
 }
 

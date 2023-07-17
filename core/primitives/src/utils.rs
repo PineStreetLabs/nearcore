@@ -11,7 +11,7 @@ use serde;
 use crate::hash::{hash, CryptoHash};
 use crate::receipt::Receipt;
 use crate::transaction::SignedTransaction;
-use crate::types::{CompiledContractCache, NumSeats, NumShards, ShardId};
+use crate::types::{NumSeats, NumShards, ShardId};
 use crate::version::{
     ProtocolVersion, CORRECT_RANDOM_VALUE_PROTOCOL_VERSION, CREATE_HASH_PROTOCOL_VERSION,
     CREATE_RECEIPT_ID_SWITCH_TO_CURRENT_BLOCK_VERSION,
@@ -408,10 +408,10 @@ macro_rules! unwrap_or_return {
 
 /// Converts timestamp in ns into DateTime UTC time.
 pub fn from_timestamp(timestamp: u64) -> DateTime<chrono::Utc> {
-    let secs =
-        timestamp.checked_div(NS_IN_SECOND).expect("dividing by non-zero const is safe") as i64;
-    let nsecs = timestamp.checked_rem(NS_IN_SECOND).expect("modulo non-zero const is safe") as u32;
-    DateTime::from_utc(NaiveDateTime::from_timestamp(secs, nsecs), chrono::Utc)
+    let secs = (timestamp / NS_IN_SECOND) as i64;
+    let nsecs = (timestamp % NS_IN_SECOND) as u32;
+    let naive = NaiveDateTime::from_timestamp_opt(secs, nsecs).unwrap();
+    DateTime::from_utc(naive, chrono::Utc)
 }
 
 /// Converts DateTime UTC time into timestamp in ns.
@@ -449,12 +449,6 @@ where
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:?}", serde_json::to_string(&self.0).unwrap())
-    }
-}
-
-impl fmt::Debug for dyn CompiledContractCache {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Compiled contracts cache")
     }
 }
 

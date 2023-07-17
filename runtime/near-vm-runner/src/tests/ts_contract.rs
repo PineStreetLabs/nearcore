@@ -1,26 +1,26 @@
-use near_primitives::contract::ContractCode;
-use near_primitives::runtime::fees::RuntimeFeesConfig;
-use near_vm_errors::{FunctionCallError, HostError};
-use near_vm_logic::mocks::mock_external::MockedExternal;
-use near_vm_logic::types::ReturnData;
-use near_vm_logic::{External, StorageGetMode, VMConfig};
+use crate::logic::errors::{FunctionCallError, HostError};
+use crate::logic::mocks::mock_external::MockedExternal;
+use crate::logic::types::ReturnData;
+use crate::logic::{External, StorageGetMode, VMConfig};
+use near_primitives_core::contract::ContractCode;
+use near_primitives_core::runtime::fees::RuntimeFeesConfig;
 
 use crate::tests::{create_context, with_vm_variants, LATEST_PROTOCOL_VERSION};
 use crate::vm_kind::VMKind;
 
 #[test]
 pub fn test_ts_contract() {
-    with_vm_variants(|vm_kind: VMKind| {
+    let config = VMConfig::test();
+    with_vm_variants(&config, |vm_kind: VMKind| {
         let code = ContractCode::new(near_test_contracts::ts_contract().to_vec(), None);
         let mut fake_external = MockedExternal::new();
 
         let context = create_context(Vec::new());
-        let config = VMConfig::test();
         let fees = RuntimeFeesConfig::test();
 
         // Call method that panics.
         let promise_results = vec![];
-        let runtime = vm_kind.runtime(config).expect("runtime has not been compiled");
+        let runtime = vm_kind.runtime(config.clone()).expect("runtime has not been compiled");
         let result = runtime.run(
             &code,
             "try_panic",

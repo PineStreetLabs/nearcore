@@ -6,11 +6,13 @@ use crate::receipt::Receipt;
 use crate::serialize::dec_format;
 use crate::trie_key::TrieKey;
 use borsh::{BorshDeserialize, BorshSerialize};
-use derive_more::{AsRef as DeriveAsRef, From as DeriveFrom};
 use near_crypto::PublicKey;
 /// Reexport primitive types
 pub use near_primitives_core::types::*;
+pub use near_vm_runner::logic::TrieNodesCount;
 use once_cell::sync::Lazy;
+use serde_with::base64::Base64;
+use serde_with::serde_as;
 use std::sync::Arc;
 
 /// Hash used by to store state root.
@@ -18,7 +20,7 @@ pub type StateRoot = CryptoHash;
 
 /// Different types of finality.
 #[derive(
-    serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq, arbitrary::Arbitrary,
+    serde::Serialize, serde::Deserialize, Default, Clone, Debug, PartialEq, Eq, arbitrary::Arbitrary,
 )]
 pub enum Finality {
     #[serde(rename = "optimistic")]
@@ -26,13 +28,8 @@ pub enum Finality {
     #[serde(rename = "near-final")]
     DoomSlug,
     #[serde(rename = "final")]
+    #[default]
     Final,
-}
-
-impl Default for Finality {
-    fn default() -> Self {
-        Finality::Final
-    }
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -54,32 +51,65 @@ pub struct AccountInfo {
 ///
 /// NOTE: Currently, this type is only used in the view_client and RPC to be able to transparently
 /// pretty-serialize the bytes arrays as base64-encoded strings (see `serialize.rs`).
+#[serde_as]
 #[derive(
-    Debug, Clone, PartialEq, Eq, DeriveAsRef, DeriveFrom, BorshSerialize, BorshDeserialize,
+    serde::Serialize,
+    serde::Deserialize,
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    derive_more::Deref,
+    derive_more::From,
+    derive_more::Into,
+    BorshSerialize,
+    BorshDeserialize,
 )]
-#[as_ref(forward)]
-pub struct StoreKey(Vec<u8>);
+#[serde(transparent)]
+pub struct StoreKey(#[serde_as(as = "Base64")] Vec<u8>);
 
 /// This type is used to mark values returned from store (arrays of bytes).
 ///
 /// NOTE: Currently, this type is only used in the view_client and RPC to be able to transparently
 /// pretty-serialize the bytes arrays as base64-encoded strings (see `serialize.rs`).
+#[serde_as]
 #[derive(
-    Debug, Clone, PartialEq, Eq, DeriveAsRef, DeriveFrom, BorshSerialize, BorshDeserialize,
+    serde::Serialize,
+    serde::Deserialize,
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    derive_more::Deref,
+    derive_more::From,
+    derive_more::Into,
+    BorshSerialize,
+    BorshDeserialize,
 )]
-#[as_ref(forward)]
-pub struct StoreValue(Vec<u8>);
+#[serde(transparent)]
+pub struct StoreValue(#[serde_as(as = "Base64")] Vec<u8>);
 
 /// This type is used to mark function arguments.
 ///
 /// NOTE: The main reason for this to exist (except the type-safety) is that the value is
 /// transparently serialized and deserialized as a base64-encoded string when serde is used
 /// (serde_json).
+#[serde_as]
 #[derive(
-    Debug, Clone, PartialEq, Eq, DeriveAsRef, DeriveFrom, BorshSerialize, BorshDeserialize,
+    serde::Serialize,
+    serde::Deserialize,
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    derive_more::Deref,
+    derive_more::From,
+    derive_more::Into,
+    BorshSerialize,
+    BorshDeserialize,
 )]
-#[as_ref(forward)]
-pub struct FunctionArgs(Vec<u8>);
+#[serde(transparent)]
+pub struct FunctionArgs(#[serde_as(as = "Base64")] Vec<u8>);
 
 /// A structure used to indicate the kind of state changes due to transaction/receipt processing, etc.
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
@@ -446,7 +476,7 @@ impl StateRootNode {
     PartialEq,
     PartialOrd,
     Ord,
-    DeriveAsRef,
+    derive_more::AsRef,
     BorshSerialize,
     BorshDeserialize,
     serde::Serialize,
@@ -907,21 +937,6 @@ pub enum TransactionOrReceiptId {
     Receipt { receipt_id: CryptoHash, receiver_id: AccountId },
 }
 
-#[derive(Debug, Clone, PartialEq, BorshDeserialize, BorshSerialize)]
-pub enum CompiledContract {
-    CompileModuleError(near_vm_errors::CompilationError),
-    Code(Vec<u8>),
-}
-
-/// Cache for compiled modules
-pub trait CompiledContractCache: Send + Sync {
-    fn put(&self, key: &CryptoHash, value: CompiledContract) -> std::io::Result<()>;
-    fn get(&self, key: &CryptoHash) -> std::io::Result<Option<CompiledContract>>;
-    fn has(&self, key: &CryptoHash) -> std::io::Result<bool> {
-        self.get(key).map(|entry| entry.is_some())
-    }
-}
-
 /// Provides information about current epoch validators.
 /// Used to break dependency between epoch manager and runtime.
 pub trait EpochInfoProvider {
@@ -955,25 +970,6 @@ pub enum TrieCacheMode {
     /// only once during a single chunk processing. Such nodes remain in cache until the chunk processing is finished,
     /// and thus users (potentially different) are not required to pay twice for retrieval of the same node.
     CachingChunk,
-}
-
-/// Counts trie nodes reads during tx/receipt execution for proper storage costs charging.
-#[derive(Debug, PartialEq)]
-pub struct TrieNodesCount {
-    /// Potentially expensive trie node reads which are served from disk in the worst case.
-    pub db_reads: u64,
-    /// Cheap trie node reads which are guaranteed to be served from RAM.
-    pub mem_reads: u64,
-}
-
-impl TrieNodesCount {
-    /// Used to determine the number of trie nodes charged during some operation.
-    pub fn checked_sub(self, other: &Self) -> Option<Self> {
-        Some(Self {
-            db_reads: self.db_reads.checked_sub(other.db_reads)?,
-            mem_reads: self.mem_reads.checked_sub(other.mem_reads)?,
-        })
-    }
 }
 
 /// State changes for a range of blocks.

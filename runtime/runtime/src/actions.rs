@@ -1,6 +1,6 @@
 use crate::config::{
-    safe_add_gas, total_prepaid_exec_fees, total_prepaid_gas, total_prepaid_send_fees,
-    RuntimeConfig,
+    safe_add_compute, safe_add_gas, total_prepaid_exec_fees, total_prepaid_gas,
+    total_prepaid_send_fees, RuntimeConfig,
 };
 use crate::ext::{ExternalError, RuntimeExt};
 use crate::{metrics, ActionResult, ApplyState};
@@ -24,19 +24,17 @@ use near_primitives::types::validator_stake::ValidatorStake;
 use near_primitives::types::{AccountId, BlockHeight, EpochInfoProvider, Gas, TrieCacheMode};
 use near_primitives::utils::create_random_seed;
 use near_primitives::version::{
-    is_implicit_account_creation_enabled, ProtocolFeature, ProtocolVersion,
-    DELETE_KEY_STORAGE_USAGE_PROTOCOL_VERSION,
+    ProtocolFeature, ProtocolVersion, DELETE_KEY_STORAGE_USAGE_PROTOCOL_VERSION,
 };
 use near_store::{
     get_access_key, get_code, remove_access_key, remove_account, set_access_key, set_code,
     StorageError, TrieUpdate,
 };
-use near_vm_errors::{
-    CompilationError, FunctionCallError, FunctionCallErrorSer, InconsistentStateError,
-    VMRunnerError,
+use near_vm_runner::logic::errors::{
+    CompilationError, FunctionCallError, InconsistentStateError, VMRunnerError,
 };
-use near_vm_logic::types::PromiseResult;
-use near_vm_logic::{ActionCosts, VMContext, VMOutcome};
+use near_vm_runner::logic::types::PromiseResult;
+use near_vm_runner::logic::{ActionCosts, VMContext, VMOutcome};
 use near_vm_runner::precompile_contract;
 
 /// Runs given function call with given context / apply state.
@@ -59,7 +57,7 @@ pub(crate) fn execute_function_call(
         Ok(Some(code)) => code,
         Ok(None) => {
             let error = FunctionCallError::CompilationError(CompilationError::CodeDoesNotExist {
-                account_id: account_id.clone(),
+                account_id: account_id.as_str().into(),
             });
             return Ok(VMOutcome::nop_outcome(error));
         }
@@ -242,8 +240,7 @@ pub(crate) fn action_function_call(
         }
         // Update action result with the abort error converted to the
         // transaction runtime's format of errors.
-        let ser: FunctionCallErrorSer = err.into();
-        let action_err: ActionError = ActionErrorKind::FunctionCallError(ser).into();
+        let action_err: ActionError = ActionErrorKind::FunctionCallError(err.into()).into();
         result.result = Err(action_err);
     }
     result.gas_burnt = safe_add_gas(result.gas_burnt, outcome.burnt_gas)?;
@@ -254,6 +251,7 @@ pub(crate) fn action_function_call(
     // return a real `gas_used` instead of the `gas_burnt` into `ActionResult` even for
     // `FunctionCall`s error.
     result.gas_used = safe_add_gas(result.gas_used, outcome.used_gas)?;
+    result.compute_usage = safe_add_compute(result.compute_usage, outcome.compute_usage)?;
     result.logs.extend(outcome.logs);
     result.profile.merge(&outcome.profile);
     if execution_succeeded {
@@ -687,6 +685,8 @@ pub(crate) fn apply_delegate_action(
     // gas_used is incremented because otherwise the gas will be refunded. Refund function checks only gas_used.
     result.gas_used = safe_add_gas(result.gas_used, prepaid_send_fees)?;
     result.gas_burnt = safe_add_gas(result.gas_burnt, prepaid_send_fees)?;
+    // TODO(#8806): Support compute costs for actions. For now they match burnt gas.
+    result.compute_usage = safe_add_compute(result.compute_usage, prepaid_send_fees)?;
     result.new_receipts.push(new_receipt);
 
     Ok(())
@@ -885,7 +885,7 @@ pub(crate) fn check_account_existence(
                 }
                 .into());
             } else {
-                if is_implicit_account_creation_enabled(current_protocol_version)
+                if checked_feature!("stable", ImplicitAccountCreation, current_protocol_version)
                     && account_id.is_implicit()
                 {
                     // If the account doesn't exist and it's 64-length hex account ID, then you
@@ -906,8 +906,11 @@ pub(crate) fn check_account_existence(
         }
         Action::Transfer(_) => {
             if account.is_none() {
-                return if is_implicit_account_creation_enabled(current_protocol_version)
-                    && is_the_only_action
+                return if checked_feature!(
+                    "stable",
+                    ImplicitAccountCreation,
+                    current_protocol_version
+                ) && is_the_only_action
                     && account_id.is_implicit()
                     && !is_refund
                 {
@@ -1371,13 +1374,13 @@ mod tests {
     #[test]
     fn test_validate_delegate_action_key_update_nonce() {
         let (_, signed_delegate_action) = create_delegate_action_receipt();
-        let sender_id = signed_delegate_action.delegate_action.sender_id.clone();
-        let sender_pub_key = signed_delegate_action.delegate_action.public_key.clone();
+        let sender_id = &signed_delegate_action.delegate_action.sender_id;
+        let sender_pub_key = &signed_delegate_action.delegate_action.public_key;
         let access_key = AccessKey { nonce: 19000000, permission: AccessKeyPermission::FullAccess };
 
         let apply_state =
             create_apply_state(signed_delegate_action.delegate_action.max_block_height);
-        let mut state_update = setup_account(&sender_id, &sender_pub_key, &access_key);
+        let mut state_update = setup_account(sender_id, sender_pub_key, &access_key);
 
         // Everything is ok
         let mut result = ActionResult::default();
@@ -1449,8 +1452,8 @@ mod tests {
             result.result,
             Err(ActionErrorKind::DelegateActionAccessKeyError(
                 InvalidAccessKeyError::AccessKeyNotFound {
-                    account_id: sender_id.clone(),
-                    public_key: sender_pub_key.clone(),
+                    account_id: sender_id,
+                    public_key: sender_pub_key,
                 },
             )
             .into())
@@ -1551,7 +1554,7 @@ mod tests {
             }),
         };
 
-        let mut delegate_action = signed_delegate_action.delegate_action.clone();
+        let mut delegate_action = signed_delegate_action.delegate_action;
         delegate_action.actions =
             vec![non_delegate_action(Action::FunctionCall(FunctionCallAction {
                 args: Vec::new(),
@@ -1575,7 +1578,7 @@ mod tests {
             }),
         };
 
-        let mut delegate_action = signed_delegate_action.delegate_action.clone();
+        let mut delegate_action = signed_delegate_action.delegate_action;
         delegate_action.actions =
             vec![non_delegate_action(Action::CreateAccount(CreateAccountAction {}))];
 
@@ -1602,7 +1605,7 @@ mod tests {
             }),
         };
 
-        let mut delegate_action = signed_delegate_action.delegate_action.clone();
+        let mut delegate_action = signed_delegate_action.delegate_action;
         delegate_action.actions = vec![
             non_delegate_action(Action::FunctionCall(FunctionCallAction {
                 args: Vec::new(),
@@ -1641,7 +1644,7 @@ mod tests {
             }),
         };
 
-        let mut delegate_action = signed_delegate_action.delegate_action.clone();
+        let mut delegate_action = signed_delegate_action.delegate_action;
         delegate_action.actions =
             vec![non_delegate_action(Action::FunctionCall(FunctionCallAction {
                 args: Vec::new(),
@@ -1673,7 +1676,7 @@ mod tests {
             }),
         };
 
-        let mut delegate_action = signed_delegate_action.delegate_action.clone();
+        let mut delegate_action = signed_delegate_action.delegate_action;
         delegate_action.actions =
             vec![non_delegate_action(Action::FunctionCall(FunctionCallAction {
                 args: Vec::new(),
@@ -1688,7 +1691,7 @@ mod tests {
             result.result,
             Err(ActionErrorKind::DelegateActionAccessKeyError(
                 InvalidAccessKeyError::ReceiverMismatch {
-                    tx_receiver: delegate_action.receiver_id.clone(),
+                    tx_receiver: delegate_action.receiver_id,
                     ak_receiver: "another.near".parse().unwrap(),
                 },
             )
@@ -1708,7 +1711,7 @@ mod tests {
             }),
         };
 
-        let mut delegate_action = signed_delegate_action.delegate_action.clone();
+        let mut delegate_action = signed_delegate_action.delegate_action;
         delegate_action.actions =
             vec![non_delegate_action(Action::FunctionCall(FunctionCallAction {
                 args: Vec::new(),

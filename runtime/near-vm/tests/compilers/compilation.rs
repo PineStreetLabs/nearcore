@@ -1,7 +1,9 @@
-use wasmer::*;
-use wasmer_engine::{Engine, Executable};
-use wasmer_engine_universal::Universal;
-use wasmer_vm::Artifact;
+use std::sync::Arc;
+
+use near_vm_compiler::CompileError;
+use near_vm_engine::universal::{LimitedMemoryPool, Universal};
+use near_vm_test_api::*;
+use near_vm_vm::Artifact;
 
 fn slow_to_compile_contract(n_fns: usize, n_locals: usize) -> Vec<u8> {
     let fns = format!("(func (local {}))\n", "i32 ".repeat(n_locals)).repeat(n_fns);
@@ -11,16 +13,16 @@ fn slow_to_compile_contract(n_fns: usize, n_locals: usize) -> Vec<u8> {
 
 fn compile_uncached<'a>(
     store: &'a Store,
-    engine: &'a dyn Engine,
+    engine: &'a UniversalEngine,
     code: &'a [u8],
     time: bool,
-) -> Result<Box<dyn wasmer_engine::Executable>, CompileError> {
+) -> Result<near_vm_engine::universal::UniversalExecutable, CompileError> {
     use std::time::Instant;
     let now = Instant::now();
     engine.validate(code)?;
     let validate = now.elapsed().as_millis();
     let now = Instant::now();
-    let res = engine.compile(code, store.tunables());
+    let res = engine.compile_universal(code, store.tunables());
     let compile = now.elapsed().as_millis();
     if time {
         println!("validate {}ms compile {}ms", validate, compile);
@@ -32,18 +34,14 @@ fn compile_uncached<'a>(
 #[ignore]
 fn compilation_test() {
     let compiler = Singlepass::default();
-    let engine = Universal::new(compiler).engine();
-    let store = Store::new(&engine);
+    let engine = Arc::new(Universal::new(compiler).engine());
+    let store = Store::new(Arc::clone(&engine));
     for factor in 1..1000 {
         let code = slow_to_compile_contract(3, 25 * factor);
         match compile_uncached(&store, &engine, &code, false) {
             Ok(art) => {
                 let serialized = art.serialize().unwrap();
-                println!(
-                    "{}: artifact is compiled, size is {}",
-                    factor,
-                    serialized.len()
-                );
+                println!("{}: artifact is compiled, size is {}", factor, serialized.len());
             }
             Err(err) => {
                 println!("err is {:?}", err);
@@ -77,13 +75,15 @@ fn profiling() {
     "#;
     let wasm = wat2wasm(wat.as_bytes()).unwrap();
     let compiler = Singlepass::default();
-    let engine = Universal::new(compiler).engine();
-    let store = Store::new(&engine);
+    let pool = LimitedMemoryPool::new(1, 0x10000).unwrap();
+    let engine = Arc::new(Universal::new(compiler).code_memory_pool(pool).engine());
+    let store = Store::new(Arc::clone(&engine));
     match compile_uncached(&store, &engine, &wasm, false) {
         Ok(art) => unsafe {
             let serialized = art.serialize().unwrap();
             let executable =
-                wasmer_engine_universal::UniversalExecutableRef::deserialize(&serialized).unwrap();
+                near_vm_engine::universal::UniversalExecutableRef::deserialize(&serialized)
+                    .unwrap();
             let artifact = engine.load_universal_executable_ref(&executable).unwrap();
             let info = artifact
                 .functions()

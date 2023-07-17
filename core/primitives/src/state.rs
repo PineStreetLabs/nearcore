@@ -61,3 +61,42 @@ mod tests {
         assert_eq!(value_ref.hash, hash(&value));
     }
 }
+
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
+pub enum FlatStateValue {
+    Ref(ValueRef),
+    Inlined(Vec<u8>),
+}
+
+impl FlatStateValue {
+    /// Defines value size threshold for flat state inlining.
+    /// It means that values having size greater than the threshold will be stored
+    /// in FlatState as `FlatStateValue::Ref`, otherwise the whole value will be
+    /// stored as `FlatStateValue::Inlined`.
+    /// See the following comment for reasoning behind the threshold value:
+    /// https://github.com/near/nearcore/issues/8243#issuecomment-1523049994
+    pub const INLINE_DISK_VALUE_THRESHOLD: usize = 4000;
+
+    pub fn on_disk(value: &[u8]) -> Self {
+        if value.len() <= Self::INLINE_DISK_VALUE_THRESHOLD {
+            Self::inlined(value)
+        } else {
+            Self::value_ref(value)
+        }
+    }
+
+    pub fn value_ref(value: &[u8]) -> Self {
+        Self::Ref(ValueRef::new(value))
+    }
+
+    pub fn inlined(value: &[u8]) -> Self {
+        Self::Inlined(value.to_vec())
+    }
+
+    pub fn to_value_ref(&self) -> ValueRef {
+        match self {
+            Self::Ref(value_ref) => value_ref.clone(),
+            Self::Inlined(value) => ValueRef::new(value),
+        }
+    }
+}

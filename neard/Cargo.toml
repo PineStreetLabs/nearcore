@@ -1,10 +1,12 @@
 [package]
 name = "neard"
-version = "0.0.0"
+version.workspace = true
 authors.workspace = true
-publish = false
 edition.workspace = true
-default-run = "neard"
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false
 
 [[bin]]
 path = "src/main.rs"
@@ -36,8 +38,10 @@ near-client.workspace = true
 near-cold-store-tool.workspace = true
 near-config-utils.workspace = true
 near-crypto.workspace = true
+near-database-tool.workspace = true
 near-dyn-configs.workspace = true
 near-flat-storage.workspace = true
+near-fork-network.workspace = true
 near-jsonrpc-primitives.workspace = true
 near-mirror.workspace = true
 near-network.workspace = true
@@ -48,6 +52,7 @@ near-primitives.workspace = true
 near-state-parts.workspace = true
 near-state-viewer.workspace = true
 near-store.workspace = true
+near-undo-block.workspace = true
 
 [build-dependencies]
 anyhow.workspace = true
@@ -65,16 +70,47 @@ delay_detector = ["nearcore/delay_detector"]
 rosetta_rpc = ["nearcore/rosetta_rpc"]
 json_rpc = ["nearcore/json_rpc"]
 protocol_feature_fix_staking_threshold = ["nearcore/protocol_feature_fix_staking_threshold"]
+protocol_feature_simple_nightshade_v2 = ["nearcore/protocol_feature_simple_nightshade_v2"]
 serialize_all_state_changes = ["nearcore/serialize_all_state_changes"]
-protocol_feature_flat_state = ["nearcore/protocol_feature_flat_state", "near-flat-storage/protocol_feature_flat_state"]
 
 nightly = [
   "nightly_protocol",
+  "protocol_feature_fix_staking_threshold",
+  "protocol_feature_simple_nightshade_v2",
+  "serialize_all_state_changes",
+  "near-chain-configs/nightly",
+  "near-client/nightly",
+  "near-database-tool/nightly",
+  "near-dyn-configs/nightly",
+  "near-fork-network/nightly",
+  "near-jsonrpc-primitives/nightly",
+  "near-mirror/nightly",
+  "near-network/nightly",
+  "near-o11y/nightly",
+  "near-ping/nightly",
+  "near-primitives/nightly",
+  "near-state-parts/nightly",
+  "near-store/nightly",
+  "near-undo-block/nightly",
   "nearcore/nightly",
-  "near-state-viewer/nightly",
-  "protocol_feature_flat_state",
 ]
-nightly_protocol = ["nearcore/nightly_protocol"]
+nightly_protocol = [
+  "near-chain-configs/nightly_protocol",
+  "near-client/nightly_protocol",
+  "near-database-tool/nightly_protocol",
+  "near-dyn-configs/nightly_protocol",
+  "near-fork-network/nightly_protocol",
+  "near-jsonrpc-primitives/nightly_protocol",
+  "near-mirror/nightly_protocol",
+  "near-network/nightly_protocol",
+  "near-o11y/nightly_protocol",
+  "near-ping/nightly_protocol",
+  "near-primitives/nightly_protocol",
+  "near-state-parts/nightly_protocol",
+  "near-store/nightly_protocol",
+  "near-undo-block/nightly_protocol",
+  "nearcore/nightly_protocol",
+]
 
 calimero_zero_storage = [
   "near-primitives/calimero_zero_storage",

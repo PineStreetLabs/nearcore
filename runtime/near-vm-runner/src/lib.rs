@@ -2,18 +2,19 @@
 
 mod cache;
 mod errors;
+mod features;
 mod imports;
 mod instrument;
+pub mod logic;
 #[cfg(all(feature = "wasmer0_vm", target_arch = "x86_64"))]
 mod memory;
-// TODO: this will need to be turned into an actual near_vm feature as soon as it’s implemented
-#[cfg(all(feature = "wasmer2_vm", target_arch = "x86_64"))]
-#[allow(dead_code)]
+#[cfg(all(feature = "near_vm", target_arch = "x86_64"))]
 mod near_vm_runner;
 pub mod prepare;
 mod runner;
 #[cfg(test)]
 mod tests;
+mod utils;
 mod vm_kind;
 #[cfg(all(feature = "wasmer2_vm", target_arch = "x86_64"))]
 mod wasmer2_runner;
@@ -22,7 +23,7 @@ mod wasmer_runner;
 #[cfg(feature = "wasmtime_vm")]
 mod wasmtime_runner;
 
-pub use near_vm_logic::with_ext_cost_counter;
+pub use crate::logic::with_ext_cost_counter;
 
 pub use cache::{get_contract_cache_key, precompile_contract, MockCompiledContractCache};
 pub use runner::{run, VM};

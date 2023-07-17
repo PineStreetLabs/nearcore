@@ -28,6 +28,11 @@ pub(crate) enum AccountRequirement {
     SameAsSigner,
     /// Use sub account of the signer. Useful for `CreateAction` estimations.
     SubOfSigner,
+    /// Account must be `generated_account_id(seed = 0)`.
+    ///
+    /// Usage: Delegate actions are signed by the sender, so it can't be
+    /// replaced with a random account.
+    ConstantAccount0,
 }
 
 impl TransactionBuilder {
@@ -95,14 +100,6 @@ impl TransactionBuilder {
         self.transaction_from_function_call(account, "account_storage_insert_key", arg)
     }
 
-    /// Transaction that checks existence of a given key under an account.
-    /// The account must have the test contract deployed.
-    pub(crate) fn account_has_key(&mut self, account: AccountId, key: &str) -> SignedTransaction {
-        let arg = (key.len() as u64).to_le_bytes().into_iter().chain(key.bytes()).collect();
-
-        self.transaction_from_function_call(account, "account_storage_has_key", arg)
-    }
-
     pub(crate) fn rng(&mut self) -> ThreadRng {
         rand::thread_rng()
     }
@@ -143,6 +140,7 @@ impl TransactionBuilder {
             AccountRequirement::SubOfSigner => {
                 format!("sub.{}", signer_id.expect("no signer_id")).parse().unwrap()
             }
+            AccountRequirement::ConstantAccount0 => self.account(0),
         }
     }
 

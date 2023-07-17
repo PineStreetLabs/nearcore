@@ -234,7 +234,7 @@ fn test_catchup_receipts_sync_common(wait_till: u64, send: u64, sync_hold: bool)
                                 .map(|x| x.0.clone())
                                 .flatten()
                                 .collect();
-                            if receipts.len() > 0 {
+                            if !receipts.is_empty() {
                                 assert_eq!(
                                     partial_encoded_chunk.header.shard_id(),
                                     source_shard_id
@@ -691,8 +691,6 @@ fn test_chunk_grieving() {
         let grieving_chunk_hash = Arc::new(RwLock::new(ChunkHash::default()));
         let unaccepted_block_hash = Arc::new(RwLock::new(CryptoHash::default()));
 
-        let _connectors1 = connectors.clone();
-
         let block_prod_time: u64 = 3500;
         let (_, conn, _) = setup_mock_all_validators(
             vs,
@@ -852,7 +850,6 @@ fn test_all_chunks_accepted_common(
 
         let verbose = false;
 
-        let _connectors1 = connectors.clone();
         let seen_chunk_same_sender = Arc::new(RwLock::new(HashSet::<(AccountId, u64, u64)>::new()));
         let requested = Arc::new(RwLock::new(HashSet::<(AccountId, Vec<u64>, ChunkHash)>::new()));
         let responded = Arc::new(RwLock::new(HashSet::<(CryptoHash, Vec<u64>, ChunkHash)>::new()));

@@ -4,7 +4,7 @@ use std::str::FromStr;
 /// Kinds of things we measure in parameter estimator and charge for in runtime.
 ///
 /// TODO: Deduplicate this enum with `ExtCosts` and `ActionCosts`.
-#[derive(Copy, Clone, PartialEq, Eq, Debug, PartialOrd, Ord, clap::ArgEnum)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, PartialOrd, Ord, clap::ValueEnum)]
 #[repr(u8)]
 pub enum Cost {
     // Every set of actions in a transaction needs to be transformed into a
@@ -202,6 +202,9 @@ pub enum Cost {
     /// Estimates `action_creation_config.delegate_cost` which is charged
     /// for `DelegateAction` actions.
     ActionDelegate,
+    ActionDelegateSendNotSir,
+    ActionDelegateSendSir,
+    ActionDelegateExec,
     /// Estimates `wasm_config.ext_costs.base` which is intended to be charged
     /// once on every host function call. However, this is currently
     /// inconsistent. First, we do not charge on Math API methods (`sha256`,
@@ -543,8 +546,10 @@ pub enum Cost {
     /// `storage_write` or `storage_remove`. The fee is paid once for each
     /// unique trie node accessed.
     ///
-    /// Estimation: Take the maximum of estimations for `TouchingTrieNodeRead`
-    /// and `TouchingTrieNodeWrite`
+    /// Estimation: Prepare an account that has many keys stored that are
+    /// prefixes from each other. Then measure write cost for the shortest and
+    /// the longest key. The gas estimation difference is divided by the
+    /// difference of actually touched nodes.
     TouchingTrieNode,
     /// It is similar to `TouchingTrieNode`, but it is charged instead of this
     /// cost when we can guarantee that trie node is cached in memory, which
@@ -559,20 +564,6 @@ pub enum Cost {
     /// for this are a bit involved but roughly speaking, it just forces values
     /// out of CPU caches so that they are always read from memory.
     ReadCachedTrieNode,
-    /// Helper estimation for `TouchingTrieNode`
-    ///
-    /// Estimation: Prepare an account that has many keys stored that are
-    /// prefixes from each other. Then measure access cost for the shortest and
-    /// the longest key. The gas estimation difference is divided by the
-    /// difference of actually touched nodes.
-    TouchingTrieNodeRead,
-    /// Helper estimation for `TouchingTrieNode`
-    ///
-    /// Estimation: Prepare an account that has many keys stored that are
-    /// prefixes from each other. Then measure write cost for the shortest and
-    /// the longest key. The gas estimation difference is divided by the
-    /// difference of actually touched nodes.
-    TouchingTrieNodeWrite,
     /// Estimates `promise_and_base` which is charged for every call to
     /// `promise_and`. This should cover the base cost for creating receipt
     /// dependencies.

@@ -1,5 +1,4 @@
 use crate::challenge::SlashedValidator;
-use crate::checked_feature;
 use crate::num_rational::Rational32;
 use crate::shard_layout::ShardLayout;
 use crate::types::validator_stake::ValidatorStakeV1;
@@ -9,6 +8,7 @@ use crate::types::{
 };
 use crate::version::PROTOCOL_VERSION;
 use borsh::{BorshDeserialize, BorshSerialize};
+use near_primitives_core::checked_feature;
 use near_primitives_core::hash::CryptoHash;
 use near_primitives_core::types::BlockHeight;
 use smart_default::SmartDefault;
@@ -91,38 +91,60 @@ impl AllEpochConfig {
     }
 
     pub fn for_protocol_version(&self, protocol_version: ProtocolVersion) -> EpochConfig {
-        // if SimpleNightshade is enabled, we override genesis shard config with
-        // the simple nightshade shard config
         let mut config = self.genesis_epoch_config.clone();
-        if self.use_production_config {
-            if checked_feature!("stable", SimpleNightshade, protocol_version) {
-                config.shard_layout = ShardLayout::get_simple_nightshade_layout();
-                config.num_block_producer_seats_per_shard = vec![
-                    config.num_block_producer_seats;
-                    config.shard_layout.num_shards()
-                        as usize
-                ];
-                config.avg_hidden_validator_seats_per_shard =
-                    vec![0; config.shard_layout.num_shards() as usize];
-            }
-            if checked_feature!("stable", ChunkOnlyProducers, protocol_version) {
-                // On testnet, genesis config set num_block_producer_seats to 200
-                // This is to bring it back to 100 to be the same as on mainnet
-                config.num_block_producer_seats = 100;
-                // Technically, after ChunkOnlyProducers is enabled, this field is no longer used
-                // We still set it here just in case
-                config.num_block_producer_seats_per_shard =
-                    vec![100; config.shard_layout.num_shards() as usize];
-                config.block_producer_kickout_threshold = 80;
-                config.chunk_producer_kickout_threshold = 80;
-                config.validator_selection_config.num_chunk_only_producer_seats = 200;
-            }
-
-            if checked_feature!("stable", MaxKickoutStake, protocol_version) {
-                config.validator_max_kickout_stake_perc = 30;
-            }
+        if !self.use_production_config {
+            return config;
         }
+
+        Self::config_nightshade(&mut config, protocol_version);
+
+        Self::config_chunk_only_producers(&mut config, protocol_version);
+
+        Self::config_max_kickout_stake(&mut config, protocol_version);
+
         config
+    }
+
+    fn config_nightshade(config: &mut EpochConfig, protocol_version: ProtocolVersion) {
+        #[cfg(feature = "protocol_feature_simple_nightshade_v2")]
+        if checked_feature!("stable", SimpleNightshadeV2, protocol_version) {
+            Self::config_nightshade_impl(config, ShardLayout::get_simple_nightshade_layout_v2());
+            return;
+        }
+
+        if checked_feature!("stable", SimpleNightshade, protocol_version) {
+            Self::config_nightshade_impl(config, ShardLayout::get_simple_nightshade_layout());
+            return;
+        }
+    }
+
+    fn config_nightshade_impl(config: &mut EpochConfig, shard_layout: ShardLayout) {
+        let num_shards = shard_layout.num_shards() as usize;
+        let num_block_producer_seats = config.num_block_producer_seats;
+        config.shard_layout = shard_layout;
+        config.num_block_producer_seats_per_shard = vec![num_block_producer_seats; num_shards];
+        config.avg_hidden_validator_seats_per_shard = vec![0; num_shards];
+    }
+
+    fn config_chunk_only_producers(config: &mut EpochConfig, protocol_version: u32) {
+        if checked_feature!("stable", ChunkOnlyProducers, protocol_version) {
+            let num_shards = config.shard_layout.num_shards() as usize;
+            // On testnet, genesis config set num_block_producer_seats to 200
+            // This is to bring it back to 100 to be the same as on mainnet
+            config.num_block_producer_seats = 100;
+            // Technically, after ChunkOnlyProducers is enabled, this field is no longer used
+            // We still set it here just in case
+            config.num_block_producer_seats_per_shard = vec![100; num_shards];
+            config.block_producer_kickout_threshold = 80;
+            config.chunk_producer_kickout_threshold = 80;
+            config.validator_selection_config.num_chunk_only_producer_seats = 200;
+        }
+    }
+
+    fn config_max_kickout_stake(config: &mut EpochConfig, protocol_version: u32) {
+        if checked_feature!("stable", MaxKickoutStake, protocol_version) {
+            config.validator_max_kickout_stake_perc = 30;
+        }
     }
 }
 
@@ -438,8 +460,9 @@ pub mod epoch_info {
     use std::collections::{BTreeMap, HashMap};
 
     use crate::types::validator_stake::ValidatorStakeV1;
-    use crate::{checked_feature, epoch_manager::RngSeed, rand::WeightedIndex};
+    use crate::{epoch_manager::RngSeed, rand::WeightedIndex};
     use near_primitives_core::{
+        checked_feature,
         hash::hash,
         types::{BlockHeight, ShardId},
     };

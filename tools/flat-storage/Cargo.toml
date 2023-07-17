@@ -1,9 +1,12 @@
 [package]
 name = "near-flat-storage"
-version = "0.0.0"
+version.workspace = true
 authors.workspace = true
-publish = false
 edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false
 
 [dependencies]
 anyhow.workspace = true
@@ -20,10 +23,3 @@ near-epoch-manager.workspace = true
 near-primitives.workspace = true
 near-store.workspace = true
 nearcore.workspace = true
-
-[features]
-protocol_feature_flat_state = [
-  "nearcore/protocol_feature_flat_state",
-  "near-chain/protocol_feature_flat_state",
-  "near-store/protocol_feature_flat_state",
-]

@@ -1,19 +1,17 @@
 [package]
 name = "near-client-primitives"
-version = "0.0.0"
+version.workspace = true
 authors.workspace = true
-publish = true
-# Please update rust-toolchain.toml as well when changing version here:
-rust-version.workspace = true
 edition.workspace = true
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/near/nearcore"
+rust-version.workspace = true
 description = "This crate hosts NEAR client-related error types"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+repository.workspace = true
+license.workspace = true
+publish = true
 
 [dependencies]
 actix.workspace = true
+ansi_term.workspace = true
 chrono.workspace = true
 once_cell.workspace = true
 serde.workspace = true
@@ -29,4 +27,13 @@ near-crypto.workspace = true
 near-primitives.workspace = true
 
 [features]
+nightly_protocol = [
+  "near-chain-configs/nightly_protocol",
+  "near-primitives/nightly_protocol",
+]
+nightly = [
+  "nightly_protocol",
+  "near-chain-configs/nightly",
+  "near-primitives/nightly",
+]
 sandbox = []

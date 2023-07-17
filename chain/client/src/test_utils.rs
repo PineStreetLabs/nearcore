@@ -6,16 +6,19 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use actix::{Actor, Addr, AsyncContext, Context};
+use actix_rt::{Arbiter, System};
 use chrono::DateTime;
 use futures::{future, FutureExt};
 use near_async::actix::AddrWithAutoSpanContextExt;
 use near_async::messaging::{CanSend, IntoSender, LateBoundSender, Sender};
+use near_async::time;
 use near_chunks::shards_manager_actor::start_shards_manager;
 use near_chunks::ShardsManager;
+use near_epoch_manager::shard_tracker::{ShardTracker, TrackedConfig};
+use near_epoch_manager::{EpochManager, EpochManagerAdapter, EpochManagerHandle};
 use near_network::shards_manager::ShardsManagerRequestFromNetwork;
 use near_primitives::errors::InvalidTxError;
 use near_primitives::test_utils::create_test_signer;
-use near_primitives::time;
 use num_rational::Ratio;
 use once_cell::sync::OnceCell;
 use rand::{thread_rng, Rng};
@@ -24,16 +27,14 @@ use tracing::info;
 use crate::{start_view_client, Client, ClientActor, SyncStatus, ViewClientActor};
 use chrono::Utc;
 use near_chain::chain::{do_apply_chunks, BlockCatchUpRequest, StateSplitRequest};
+use near_chain::state_snapshot_actor::MakeSnapshotCallback;
 use near_chain::test_utils::{
     wait_for_all_blocks_in_processing, wait_for_block_in_processing, KeyValueRuntime,
-    ValidatorSchedule,
+    MockEpochManager, ValidatorSchedule,
 };
-use near_chain::types::ChainConfig;
-use near_chain::{
-    Chain, ChainGenesis, ChainStoreAccess, DoomslugThresholdMode, Provenance,
-    RuntimeWithEpochManagerAdapter,
-};
-use near_chain_configs::ClientConfig;
+use near_chain::types::{ChainConfig, RuntimeAdapter};
+use near_chain::{Chain, ChainGenesis, ChainStoreAccess, DoomslugThresholdMode, Provenance};
+use near_chain_configs::{ClientConfig, GenesisConfig};
 use near_chunks::adapter::ShardsManagerRequestFromClient;
 use near_chunks::client::ShardsManagerResponse;
 use near_chunks::test_utils::{MockClientAdapterForShardsManager, SynchronousShardsManagerAdapter};
@@ -67,7 +68,8 @@ use near_primitives::static_clock::StaticClock;
 use near_primitives::transaction::{Action, FunctionCallAction, SignedTransaction};
 
 use near_primitives::types::{
-    AccountId, Balance, BlockHeight, BlockHeightDelta, EpochId, NumBlocks, NumSeats, ShardId,
+    AccountId, Balance, BlockHeight, BlockHeightDelta, EpochId, NumBlocks, NumSeats, NumShards,
+    ShardId,
 };
 use near_primitives::utils::MaybeValidated;
 use near_primitives::validator_signer::ValidatorSigner;
@@ -176,7 +178,7 @@ impl Client {
         accepted_blocks
     }
 
-    /// This function finishes processing block with hash `hash`, if the procesing of that block
+    /// This function finishes processing block with hash `hash`, if the processing of that block
     /// has started.
     pub fn finish_block_in_processing(&mut self, hash: &CryptoHash) -> Vec<CryptoHash> {
         if let Ok(()) = wait_for_block_in_processing(&mut self.chain, hash) {
@@ -198,6 +200,7 @@ pub fn setup(
     enable_doomslug: bool,
     archive: bool,
     epoch_sync_enabled: bool,
+    state_sync_enabled: bool,
     network_adapter: PeerManagerAdapter,
     transaction_validity_period: NumBlocks,
     genesis_time: DateTime<Utc>,
@@ -205,8 +208,9 @@ pub fn setup(
 ) -> (Block, ClientActor, Addr<ViewClientActor>, ShardsManagerAdapterForTest) {
     let store = create_test_store();
     let num_validator_seats = vs.all_block_producers().count() as NumSeats;
-    let runtime =
-        KeyValueRuntime::new_with_validators_and_no_gc(store.clone(), vs, epoch_length, archive);
+    let epoch_manager = MockEpochManager::new_with_validators(store.clone(), vs, epoch_length);
+    let shard_tracker = ShardTracker::new_empty(epoch_manager.clone());
+    let runtime = KeyValueRuntime::new_with_no_gc(store.clone(), epoch_manager.as_ref(), archive);
     let chain_genesis = ChainGenesis {
         time: genesis_time,
         height: 0,
@@ -225,10 +229,17 @@ pub fn setup(
         DoomslugThresholdMode::NoApprovals
     };
     let chain = Chain::new(
+        epoch_manager.clone(),
+        shard_tracker.clone(),
         runtime.clone(),
         &chain_genesis,
         doomslug_threshold_mode,
-        ChainConfig { save_trie_changes: true, background_migration_threads: 1 },
+        ChainConfig {
+            save_trie_changes: true,
+            background_migration_threads: 1,
+            state_snapshot_every_n_blocks: None,
+        },
+        None,
     )
     .unwrap();
     let genesis_block = chain.get_block(&chain.genesis().hash().clone()).unwrap();
@@ -243,6 +254,7 @@ pub fn setup(
         archive,
         true,
         epoch_sync_enabled,
+        state_sync_enabled,
     );
 
     let adv = crate::adversarial::Controls::default();
@@ -250,6 +262,8 @@ pub fn setup(
     let view_client_addr = start_view_client(
         Some(signer.validator_id().clone()),
         chain_genesis.clone(),
+        epoch_manager.clone(),
+        shard_tracker.clone(),
         runtime.clone(),
         network_adapter.clone(),
         config.clone(),
@@ -257,7 +271,8 @@ pub fn setup(
     );
 
     let (shards_manager_addr, _) = start_shards_manager(
-        runtime.clone(),
+        epoch_manager.clone(),
+        shard_tracker.clone(),
         network_adapter.clone().into_sender(),
         ctx.address().with_auto_span_context().into_sender(),
         Some(account_id),
@@ -269,12 +284,15 @@ pub fn setup(
     let client = Client::new(
         config.clone(),
         chain_genesis,
+        epoch_manager,
+        shard_tracker,
         runtime,
         network_adapter.clone(),
         shards_manager_adapter.as_sender(),
         Some(signer.clone()),
         enable_doomslug,
         TEST_SEED,
+        None,
     )
     .unwrap();
     let client_actor = ClientActor::new(
@@ -304,13 +322,16 @@ pub fn setup_only_view(
     enable_doomslug: bool,
     archive: bool,
     epoch_sync_enabled: bool,
+    state_sync_enabled: bool,
     network_adapter: PeerManagerAdapter,
     transaction_validity_period: NumBlocks,
     genesis_time: DateTime<Utc>,
 ) -> Addr<ViewClientActor> {
     let store = create_test_store();
     let num_validator_seats = vs.all_block_producers().count() as NumSeats;
-    let runtime = KeyValueRuntime::new_with_validators_and_no_gc(store, vs, epoch_length, archive);
+    let epoch_manager = MockEpochManager::new_with_validators(store.clone(), vs, epoch_length);
+    let shard_tracker = ShardTracker::new_empty(epoch_manager.clone());
+    let runtime = KeyValueRuntime::new_with_no_gc(store, epoch_manager.as_ref(), archive);
     let chain_genesis = ChainGenesis {
         time: genesis_time,
         height: 0,
@@ -330,10 +351,17 @@ pub fn setup_only_view(
         DoomslugThresholdMode::NoApprovals
     };
     Chain::new(
+        epoch_manager.clone(),
+        shard_tracker.clone(),
         runtime.clone(),
         &chain_genesis,
         doomslug_threshold_mode,
-        ChainConfig { save_trie_changes: true, background_migration_threads: 1 },
+        ChainConfig {
+            save_trie_changes: true,
+            background_migration_threads: 1,
+            state_snapshot_every_n_blocks: None,
+        },
+        None,
     )
     .unwrap();
 
@@ -347,6 +375,7 @@ pub fn setup_only_view(
         archive,
         true,
         epoch_sync_enabled,
+        state_sync_enabled,
     );
 
     let adv = crate::adversarial::Controls::default();
@@ -354,6 +383,8 @@ pub fn setup_only_view(
     start_view_client(
         Some(signer.validator_id().clone()),
         chain_genesis,
+        epoch_manager,
+        shard_tracker,
         runtime,
         network_adapter,
         config,
@@ -406,7 +437,7 @@ pub fn setup_mock_with_validity_period_and_no_epoch_sync(
         let vs = ValidatorSchedule::new().block_producers_per_epoch(vec![validators]);
         let (_, client, view_client_addr, shards_manager_adapter) = setup(
             vs,
-            5,
+            10,
             account_id,
             skip_sync_wait,
             MIN_BLOCK_PROD_TIME.as_millis() as u64,
@@ -414,6 +445,7 @@ pub fn setup_mock_with_validity_period_and_no_epoch_sync(
             enable_doomslug,
             false,
             false,
+            true,
             network_adapter.clone().into(),
             transaction_validity_period,
             StaticClock::utc(),
@@ -707,9 +739,9 @@ pub fn setup_mock_all_validators(
                                 },
                                 received_bytes_per_sec: 0,
                                 sent_bytes_per_sec: 0,
-                                last_time_peer_requested: near_primitives::time::Instant::now(),
-                                last_time_received_message: near_primitives::time::Instant::now(),
-                                connection_established_time: near_primitives::time::Instant::now(),
+                                last_time_peer_requested: near_async::time::Instant::now(),
+                                last_time_received_message: near_async::time::Instant::now(),
+                                connection_established_time: near_async::time::Instant::now(),
                                 peer_type: PeerType::Outbound,
                                 nonce: 3,
                             })
@@ -1053,6 +1085,7 @@ pub fn setup_mock_all_validators(
                 enable_doomslug,
                 archive1[index],
                 epoch_sync_enabled1[index],
+                true,
                 Arc::new(pm).into(),
                 10000,
                 genesis_time,
@@ -1121,25 +1154,39 @@ pub fn setup_client_with_runtime(
     network_adapter: PeerManagerAdapter,
     shards_manager_adapter: ShardsManagerAdapterForTest,
     chain_genesis: ChainGenesis,
-    runtime_adapter: Arc<dyn RuntimeWithEpochManagerAdapter>,
+    epoch_manager: Arc<dyn EpochManagerAdapter>,
+    shard_tracker: ShardTracker,
+    runtime: Arc<dyn RuntimeAdapter>,
     rng_seed: RngSeed,
     archive: bool,
     save_trie_changes: bool,
+    make_state_snapshot_callback: Option<MakeSnapshotCallback>,
 ) -> Client {
     let validator_signer =
         account_id.map(|x| Arc::new(create_test_signer(x.as_str())) as Arc<dyn ValidatorSigner>);
-    let mut config =
-        ClientConfig::test(true, 10, 20, num_validator_seats, archive, save_trie_changes, true);
+    let mut config = ClientConfig::test(
+        true,
+        10,
+        20,
+        num_validator_seats,
+        archive,
+        save_trie_changes,
+        true,
+        true,
+    );
     config.epoch_length = chain_genesis.epoch_length;
     let mut client = Client::new(
         config,
         chain_genesis,
-        runtime_adapter,
+        epoch_manager,
+        shard_tracker,
+        runtime,
         network_adapter,
         shards_manager_adapter.client,
         validator_signer,
         enable_doomslug,
         rng_seed,
+        make_state_snapshot_callback,
     )
     .unwrap();
     client.sync_status = SyncStatus::NoSync;
@@ -1159,8 +1206,10 @@ pub fn setup_client(
     save_trie_changes: bool,
 ) -> Client {
     let num_validator_seats = vs.all_block_producers().count() as NumSeats;
-    let runtime_adapter =
-        KeyValueRuntime::new_with_validators(store, vs, chain_genesis.epoch_length);
+    let epoch_manager =
+        MockEpochManager::new_with_validators(store.clone(), vs, chain_genesis.epoch_length);
+    let shard_tracker = ShardTracker::new_empty(epoch_manager.clone());
+    let runtime = KeyValueRuntime::new(store, epoch_manager.as_ref());
     setup_client_with_runtime(
         num_validator_seats,
         account_id,
@@ -1168,10 +1217,13 @@ pub fn setup_client(
         network_adapter,
         shards_manager_adapter,
         chain_genesis,
-        runtime_adapter,
+        epoch_manager,
+        shard_tracker,
+        runtime,
         rng_seed,
         archive,
         save_trie_changes,
+        None,
     )
 }
 
@@ -1179,7 +1231,9 @@ pub fn setup_synchronous_shards_manager(
     account_id: Option<AccountId>,
     client_adapter: Sender<ShardsManagerResponse>,
     network_adapter: PeerManagerAdapter,
-    runtime_adapter: Arc<dyn RuntimeWithEpochManagerAdapter>,
+    epoch_manager: Arc<dyn EpochManagerAdapter>,
+    shard_tracker: ShardTracker,
+    runtime: Arc<dyn RuntimeAdapter>,
     chain_genesis: &ChainGenesis,
 ) -> ShardsManagerAdapterForTest {
     // Initialize the chain, to make sure that if the store is empty, we write the genesis
@@ -1188,10 +1242,17 @@ pub fn setup_synchronous_shards_manager(
     // TODO(#8324): This should just be refactored so that we can construct Chain first
     // before anything else.
     let chain = Chain::new(
-        runtime_adapter.clone(),
+        epoch_manager.clone(),
+        shard_tracker.clone(),
+        runtime,
         chain_genesis,
         DoomslugThresholdMode::TwoThirds, // irrelevant
-        ChainConfig { save_trie_changes: true, background_migration_threads: 1 }, // irrelevant
+        ChainConfig {
+            save_trie_changes: true,
+            background_migration_threads: 1,
+            state_snapshot_every_n_blocks: None,
+        }, // irrelevant
+        None,
     )
     .unwrap();
     let chain_head = chain.head().unwrap();
@@ -1199,7 +1260,8 @@ pub fn setup_synchronous_shards_manager(
     let shards_manager = ShardsManager::new(
         time::Clock::real(),
         account_id,
-        runtime_adapter,
+        epoch_manager,
+        shard_tracker,
         network_adapter.request_sender,
         client_adapter,
         chain.store().new_read_only_chunks_store(),
@@ -1222,13 +1284,17 @@ pub fn setup_client_with_synchronous_shards_manager(
     save_trie_changes: bool,
 ) -> Client {
     let num_validator_seats = vs.all_block_producers().count() as NumSeats;
-    let runtime_adapter =
-        KeyValueRuntime::new_with_validators(store, vs, chain_genesis.epoch_length);
+    let epoch_manager =
+        MockEpochManager::new_with_validators(store.clone(), vs, chain_genesis.epoch_length);
+    let shard_tracker = ShardTracker::new_empty(epoch_manager.clone());
+    let runtime = KeyValueRuntime::new(store, epoch_manager.as_ref());
     let shards_manager_adapter = setup_synchronous_shards_manager(
         account_id.clone(),
         client_adapter,
         network_adapter.clone(),
-        runtime_adapter.clone(),
+        epoch_manager.clone(),
+        shard_tracker.clone(),
+        runtime.clone(),
         &chain_genesis,
     );
     setup_client_with_runtime(
@@ -1238,10 +1304,13 @@ pub fn setup_client_with_synchronous_shards_manager(
         network_adapter,
         shards_manager_adapter,
         chain_genesis,
-        runtime_adapter,
+        epoch_manager,
+        shard_tracker,
+        runtime,
         rng_seed,
         archive,
         save_trie_changes,
+        None,
     )
 }
 
@@ -1278,18 +1347,38 @@ pub struct TestEnv {
     save_trie_changes: bool,
 }
 
+#[derive(derive_more::From, Clone)]
+enum EpochManagerKind {
+    Mock(Arc<MockEpochManager>),
+    Handle(Arc<EpochManagerHandle>),
+}
+
+impl EpochManagerKind {
+    pub fn into_adapter(self) -> Arc<dyn EpochManagerAdapter> {
+        match self {
+            Self::Mock(mock) => mock,
+            Self::Handle(handle) => handle,
+        }
+    }
+}
+
 /// A builder for the TestEnv structure.
 pub struct TestEnvBuilder {
     chain_genesis: ChainGenesis,
     clients: Vec<AccountId>,
     validators: Vec<AccountId>,
-    runtime_adapters: Option<Vec<Arc<dyn RuntimeWithEpochManagerAdapter>>>,
+    stores: Option<Vec<Store>>,
+    epoch_managers: Option<Vec<EpochManagerKind>>,
+    shard_trackers: Option<Vec<ShardTracker>>,
+    runtimes: Option<Vec<Arc<dyn RuntimeAdapter>>>,
     network_adapters: Option<Vec<Arc<MockPeerManagerAdapter>>>,
+    num_shards: Option<NumShards>,
     // random seed to be inject in each client according to AccountId
     // if not set, a default constant TEST_SEED will be injected
     seeds: HashMap<AccountId, RngSeed>,
     archive: bool,
     save_trie_changes: bool,
+    add_state_snapshots: bool,
 }
 
 /// Builder for the [`TestEnv`] structure.
@@ -1303,11 +1392,16 @@ impl TestEnvBuilder {
             chain_genesis,
             clients,
             validators,
-            runtime_adapters: None,
+            stores: None,
+            epoch_managers: None,
+            shard_trackers: None,
+            runtimes: None,
             network_adapters: None,
+            num_shards: None,
             seeds,
             archive: false,
             save_trie_changes: true,
+            add_state_snapshots: false,
         }
     }
 
@@ -1315,6 +1409,11 @@ impl TestEnvBuilder {
     /// vector is empty.
     pub fn clients(mut self, clients: Vec<AccountId>) -> Self {
         assert!(!clients.is_empty());
+        assert!(self.stores.is_none(), "Cannot set clients after stores");
+        assert!(self.epoch_managers.is_none(), "Cannot set clients after epoch_managers");
+        assert!(self.shard_trackers.is_none(), "Cannot set clients after shard_trackers");
+        assert!(self.runtimes.is_none(), "Cannot set clients after runtimes");
+        assert!(self.network_adapters.is_none(), "Cannot set clients after network_adapters");
         self.clients = clients;
         self
     }
@@ -1337,6 +1436,7 @@ impl TestEnvBuilder {
     /// the vector is empty.
     pub fn validators(mut self, validators: Vec<AccountId>) -> Self {
         assert!(!validators.is_empty());
+        assert!(self.epoch_managers.is_none(), "Cannot set validators after epoch_managers");
         self.validators = validators;
         self
     }
@@ -1349,18 +1449,221 @@ impl TestEnvBuilder {
         self.validators(Self::make_accounts(num))
     }
 
-    /// Specifies custom runtime adaptors for each client.  This allows us to
-    /// construct [`TestEnv`] with `NightshadeRuntime`.
+    /// Overrides the stores that are used to create epoch managers and runtimes.
+    pub fn stores(mut self, stores: Vec<Store>) -> Self {
+        assert_eq!(stores.len(), self.clients.len());
+        assert!(self.stores.is_none(), "Cannot override twice");
+        assert!(self.epoch_managers.is_none(), "Cannot override store after epoch_managers");
+        assert!(self.runtimes.is_none(), "Cannot override store after runtimes");
+        self.stores = Some(stores);
+        self
+    }
+
+    /// Internal impl to make sure the stores are initialized.
+    fn ensure_stores(self) -> Self {
+        if self.stores.is_some() {
+            self
+        } else {
+            let num_clients = self.clients.len();
+            self.stores((0..num_clients).map(|_| create_test_store()).collect())
+        }
+    }
+
+    /// Specifies custom MockEpochManager for each client.  This allows us to
+    /// construct [`TestEnv`] with a custom implementation.
     ///
     /// The vector must have the same number of elements as they are clients
     /// (one by default).  If that does not hold, [`Self::build`] method will
     /// panic.
-    pub fn runtime_adapters(
-        mut self,
-        adapters: Vec<Arc<dyn RuntimeWithEpochManagerAdapter>>,
-    ) -> Self {
-        self.runtime_adapters = Some(adapters);
+    pub fn mock_epoch_managers(mut self, epoch_managers: Vec<Arc<MockEpochManager>>) -> Self {
+        assert_eq!(epoch_managers.len(), self.clients.len());
+        assert!(self.epoch_managers.is_none(), "Cannot override twice");
+        assert!(
+            self.num_shards.is_none(),
+            "Cannot set both num_shards and epoch_managers at the same time"
+        );
+        assert!(
+            self.shard_trackers.is_none(),
+            "Cannot override epoch_managers after shard_trackers"
+        );
+        assert!(self.runtimes.is_none(), "Cannot override epoch_managers after runtimes");
+        self.epoch_managers =
+            Some(epoch_managers.into_iter().map(|epoch_manager| epoch_manager.into()).collect());
         self
+    }
+
+    /// Specifies custom EpochManagerHandle for each client.  This allows us to
+    /// construct [`TestEnv`] with a custom implementation.
+    ///
+    /// The vector must have the same number of elements as they are clients
+    /// (one by default).  If that does not hold, [`Self::build`] method will
+    /// panic.
+    pub fn epoch_managers(mut self, epoch_managers: Vec<Arc<EpochManagerHandle>>) -> Self {
+        assert_eq!(epoch_managers.len(), self.clients.len());
+        assert!(self.epoch_managers.is_none(), "Cannot override twice");
+        assert!(
+            self.num_shards.is_none(),
+            "Cannot set both num_shards and epoch_managers at the same time"
+        );
+        assert!(
+            self.shard_trackers.is_none(),
+            "Cannot override epoch_managers after shard_trackers"
+        );
+        assert!(self.runtimes.is_none(), "Cannot override epoch_managers after runtimes");
+        self.epoch_managers =
+            Some(epoch_managers.into_iter().map(|epoch_manager| epoch_manager.into()).collect());
+        self
+    }
+
+    /// Constructs real EpochManager implementations for each instance.
+    pub fn real_epoch_managers(self, genesis_config: &GenesisConfig) -> Self {
+        assert!(
+            self.num_shards.is_none(),
+            "Cannot set both num_shards and epoch_managers at the same time"
+        );
+        let ret = self.ensure_stores();
+        let epoch_managers = (0..ret.clients.len())
+            .map(|i| {
+                EpochManager::new_arc_handle(
+                    ret.stores.as_ref().unwrap()[i].clone(),
+                    genesis_config,
+                )
+            })
+            .collect();
+        ret.epoch_managers(epoch_managers)
+    }
+
+    /// Internal impl to make sure EpochManagers are initialized.
+    fn ensure_epoch_managers(self) -> Self {
+        let mut ret = self.ensure_stores();
+        if ret.epoch_managers.is_some() {
+            ret
+        } else {
+            let epoch_managers: Vec<EpochManagerKind> = (0..ret.clients.len())
+                .map(|i| {
+                    let vs = ValidatorSchedule::new_with_shards(ret.num_shards.unwrap_or(1))
+                        .block_producers_per_epoch(vec![ret.validators.clone()]);
+                    MockEpochManager::new_with_validators(
+                        ret.stores.as_ref().unwrap()[i].clone(),
+                        vs,
+                        ret.chain_genesis.epoch_length,
+                    )
+                    .into()
+                })
+                .collect();
+            assert!(
+                ret.shard_trackers.is_none(),
+                "Cannot override shard_trackers without overriding epoch_managers"
+            );
+            assert!(
+                ret.runtimes.is_none(),
+                "Cannot override runtimes without overriding epoch_managers"
+            );
+            ret.epoch_managers = Some(epoch_managers);
+            ret
+        }
+    }
+
+    /// Visible for extension methods in integration-tests.
+    pub fn internal_ensure_epoch_managers_for_nightshade_runtime(
+        self,
+    ) -> (Self, Vec<Store>, Vec<Arc<EpochManagerHandle>>) {
+        let builder = self.ensure_epoch_managers();
+        let stores = builder.stores.clone().unwrap();
+        let epoch_managers = builder
+            .epoch_managers
+            .clone()
+            .unwrap()
+            .into_iter()
+            .map(|kind| match kind {
+                EpochManagerKind::Mock(_) => {
+                    panic!("NightshadeRuntime can only be instantiated with EpochManagerHandle")
+                }
+                EpochManagerKind::Handle(handle) => handle,
+            })
+            .collect();
+        (builder, stores, epoch_managers)
+    }
+
+    /// Specifies custom ShardTracker for each client.  This allows us to
+    /// construct [`TestEnv`] with a custom implementation.
+    pub fn shard_trackers(mut self, shard_trackers: Vec<ShardTracker>) -> Self {
+        assert_eq!(shard_trackers.len(), self.clients.len());
+        assert!(self.shard_trackers.is_none(), "Cannot override twice");
+        self.shard_trackers = Some(shard_trackers);
+        self
+    }
+
+    /// Constructs ShardTracker that tracks all shards for each instance.
+    ///
+    /// Note that in order to track *NO* shards, just don't override shard_trackers.
+    pub fn track_all_shards(self) -> Self {
+        let ret = self.ensure_epoch_managers();
+        let shard_trackers = ret
+            .epoch_managers
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|epoch_manager| {
+                ShardTracker::new(TrackedConfig::AllShards, epoch_manager.clone().into_adapter())
+            })
+            .collect();
+        ret.shard_trackers(shard_trackers)
+    }
+
+    /// Internal impl to make sure ShardTrackers are initialized.
+    fn ensure_shard_trackers(self) -> Self {
+        let ret = self.ensure_epoch_managers();
+        if ret.shard_trackers.is_some() {
+            ret
+        } else {
+            let shard_trackers = ret
+                .epoch_managers
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|epoch_manager| {
+                    ShardTracker::new(
+                        TrackedConfig::new_empty(),
+                        epoch_manager.clone().into_adapter(),
+                    )
+                })
+                .collect();
+            ret.shard_trackers(shard_trackers)
+        }
+    }
+
+    /// Specifies custom RuntimeAdapter for each client.  This allows us to
+    /// construct [`TestEnv`] with a custom implementation.
+    pub fn runtimes(mut self, runtimes: Vec<Arc<dyn RuntimeAdapter>>) -> Self {
+        assert_eq!(runtimes.len(), self.clients.len());
+        assert!(self.runtimes.is_none(), "Cannot override twice");
+        self.runtimes = Some(runtimes);
+        self
+    }
+
+    /// Internal impl to make sure runtimes are initialized.
+    fn ensure_runtimes(self) -> Self {
+        let ret = self.ensure_epoch_managers();
+        if ret.runtimes.is_some() {
+            ret
+        } else {
+            let runtimes = (0..ret.clients.len())
+                .map(|i| {
+                    let epoch_manager = match &ret.epoch_managers.as_ref().unwrap()[i] {
+                        EpochManagerKind::Mock(mock) => mock.as_ref(),
+                        EpochManagerKind::Handle(_) => {
+                            panic!(
+                                "Can only default construct KeyValueRuntime with MockEpochManager"
+                            )
+                        }
+                    };
+                    KeyValueRuntime::new(ret.stores.as_ref().unwrap()[i].clone(), epoch_manager)
+                        as Arc<dyn RuntimeAdapter>
+                })
+                .collect();
+            ret.runtimes(runtimes)
+        }
     }
 
     /// Specifies custom network adaptors for each client.
@@ -1370,6 +1673,25 @@ impl TestEnvBuilder {
     /// panic.
     pub fn network_adapters(mut self, adapters: Vec<Arc<MockPeerManagerAdapter>>) -> Self {
         self.network_adapters = Some(adapters);
+        self
+    }
+
+    /// Internal impl to make sure network adapters are initialized.
+    fn ensure_network_adapters(self) -> Self {
+        if self.network_adapters.is_some() {
+            self
+        } else {
+            let num_clients = self.clients.len();
+            self.network_adapters((0..num_clients).map(|_| Arc::new(Default::default())).collect())
+        }
+    }
+
+    pub fn num_shards(mut self, num_shards: NumShards) -> Self {
+        assert!(
+            self.epoch_managers.is_none(),
+            "Cannot set both num_shards and epoch_managers at the same time"
+        );
+        self.num_shards = Some(num_shards);
         self
     }
 
@@ -1393,49 +1715,37 @@ impl TestEnvBuilder {
     /// the length of the vectors passed to them did not equal number of
     /// configured clients.
     pub fn build(self) -> TestEnv {
+        self.ensure_shard_trackers().ensure_runtimes().ensure_network_adapters().build_impl()
+    }
+
+    fn build_impl(self) -> TestEnv {
         let chain_genesis = self.chain_genesis;
         let clients = self.clients.clone();
         let num_clients = clients.len();
         let validators = self.validators;
         let num_validators = validators.len();
         let seeds = self.seeds;
-        let runtime_adapters = match self.runtime_adapters {
-            Some(runtime_adapters) => {
-                assert_eq!(runtime_adapters.len(), num_clients);
-                runtime_adapters
-            }
-            None => (0..num_clients)
-                .map(|_| {
-                    let vs = ValidatorSchedule::new()
-                        .block_producers_per_epoch(vec![validators.clone()]);
-                    KeyValueRuntime::new_with_validators(
-                        create_test_store(),
-                        vs,
-                        chain_genesis.epoch_length,
-                    ) as Arc<dyn RuntimeWithEpochManagerAdapter>
-                })
-                .collect(),
-        };
-        let network_adapters = match self.network_adapters {
-            Some(network_adapters) => {
-                assert_eq!(network_adapters.len(), num_clients);
-                network_adapters
-            }
-            None => (0..num_clients).map(|_| Arc::new(Default::default())).collect(),
-        };
+        let epoch_managers = self.epoch_managers.unwrap();
+        let shard_trackers = self.shard_trackers.unwrap();
+        let runtimes = self.runtimes.unwrap();
+        let network_adapters = self.network_adapters.unwrap();
         let client_adapters = (0..num_clients)
             .map(|_| Arc::new(MockClientAdapterForShardsManager::default()))
             .collect::<Vec<_>>();
         let shards_manager_adapters = (0..num_clients)
             .map(|i| {
-                let runtime_adapter = runtime_adapters[i].clone();
+                let epoch_manager = epoch_managers[i].clone();
+                let shard_tracker = shard_trackers[i].clone();
+                let runtime = runtimes[i].clone();
                 let network_adapter = network_adapters[i].clone();
                 let client_adapter = client_adapters[i].clone();
                 setup_synchronous_shards_manager(
                     Some(clients[i].clone()),
                     client_adapter.as_sender(),
                     network_adapter.into(),
-                    runtime_adapter,
+                    epoch_manager.into_adapter(),
+                    shard_tracker,
+                    runtime,
                     &chain_genesis,
                 )
             })
@@ -1445,10 +1755,22 @@ impl TestEnvBuilder {
                 let account_id = clients[i].clone();
                 let network_adapter = network_adapters[i].clone();
                 let shards_manager_adapter = shards_manager_adapters[i].clone();
-                let runtime_adapter = runtime_adapters[i].clone();
+                let epoch_manager = epoch_managers[i].clone();
+                let shard_tracker = shard_trackers[i].clone();
+                let runtime = runtimes[i].clone();
                 let rng_seed = match seeds.get(&account_id) {
                     Some(seed) => *seed,
                     None => TEST_SEED,
+                };
+                let make_state_snapshot_callback : Option<MakeSnapshotCallback> = if self.add_state_snapshots {
+                    let runtime = runtime.clone();
+                    let snapshot : MakeSnapshotCallback = Arc::new(move |prev_block_hash, shard_uids| {
+                        tracing::info!(target: "state_snapshot", ?prev_block_hash, "make_snapshot_callback");
+                        runtime.get_tries().make_state_snapshot(&prev_block_hash, &shard_uids).unwrap();
+                    });
+                    Some(snapshot)
+                } else {
+                    None
                 };
                 setup_client_with_runtime(
                     u64::try_from(num_validators).unwrap(),
@@ -1457,10 +1779,13 @@ impl TestEnvBuilder {
                     network_adapter.into(),
                     shards_manager_adapter,
                     chain_genesis.clone(),
-                    runtime_adapter,
+                    epoch_manager.into_adapter(),
+                    shard_tracker,
+                    runtime,
                     rng_seed,
                     self.archive,
                     self.save_trie_changes,
+                    make_state_snapshot_callback,
                 )
             })
             .collect();
@@ -1487,6 +1812,11 @@ impl TestEnvBuilder {
 
     fn make_accounts(count: usize) -> Vec<AccountId> {
         (0..count).map(|i| format!("test{}", i).parse().unwrap()).collect()
+    }
+
+    pub fn use_state_snapshots(mut self) -> Self {
+        self.add_state_snapshots = true;
+        self
     }
 }
 
@@ -1686,18 +2016,21 @@ impl TestEnv {
         self.clients[id].process_tx(tx, false, false)
     }
 
+    /// This function will actually bump to the latest protocol version instead of the provided one.
+    /// See https://github.com/near/nearcore/issues/8590 for details.
     pub fn upgrade_protocol(&mut self, protocol_version: ProtocolVersion) {
         assert_eq!(self.clients.len(), 1, "at the moment, this support only a single client");
 
         let tip = self.clients[0].chain.head().unwrap();
         let epoch_id = self.clients[0]
-            .runtime_adapter
+            .epoch_manager
             .get_epoch_id_from_prev_block(&tip.last_block_hash)
             .unwrap();
         let block_producer =
-            self.clients[0].runtime_adapter.get_block_producer(&epoch_id, tip.height).unwrap();
+            self.clients[0].epoch_manager.get_block_producer(&epoch_id, tip.height).unwrap();
 
         let mut block = self.clients[0].produce_block(tip.height + 1).unwrap().unwrap();
+        eprintln!("Producing block with version {protocol_version}");
         block.mut_header().set_latest_protocol_version(protocol_version);
         block.mut_header().resign(&create_test_signer(block_producer.as_str()));
 
@@ -1778,7 +2111,6 @@ impl TestEnv {
         };
         let vs = ValidatorSchedule::new().block_producers_per_epoch(vec![self.validators.clone()]);
         let num_validator_seats = vs.all_block_producers().count() as NumSeats;
-        let runtime_adapter = self.clients[idx].runtime_adapter.clone();
         self.clients[idx] = setup_client_with_runtime(
             num_validator_seats,
             Some(self.get_client_id(idx).clone()),
@@ -1786,10 +2118,13 @@ impl TestEnv {
             self.network_adapters[idx].clone().into(),
             self.shards_manager_adapters[idx].clone(),
             self.chain_genesis.clone(),
-            runtime_adapter,
+            self.clients[idx].epoch_manager.clone(),
+            self.clients[idx].shard_tracker.clone(),
+            self.clients[idx].runtime_adapter.clone(),
             rng_seed,
             self.archive,
             self.save_trie_changes,
+            None,
         )
     }
 
@@ -1924,8 +2259,9 @@ pub fn create_chunk_on_height_for_shard(
     client
         .produce_chunk(
             last_block_hash,
-            &client.runtime_adapter.get_epoch_id_from_prev_block(&last_block_hash).unwrap(),
-            Chain::get_prev_chunk_header(&*client.runtime_adapter, &last_block, shard_id).unwrap(),
+            &client.epoch_manager.get_epoch_id_from_prev_block(&last_block_hash).unwrap(),
+            Chain::get_prev_chunk_header(client.epoch_manager.as_ref(), &last_block, shard_id)
+                .unwrap(),
             next_height,
             shard_id,
         )
@@ -1975,8 +2311,8 @@ pub fn create_chunk(
     // reconstruct the chunk with changes (if any)
     if should_replace {
         // The best way it to decode chunk, replace transactions and then recreate encoded chunk.
-        let total_parts = client.chain.runtime_adapter.num_total_parts();
-        let data_parts = client.chain.runtime_adapter.num_data_parts();
+        let total_parts = client.chain.epoch_manager.num_total_parts();
+        let data_parts = client.chain.epoch_manager.num_data_parts();
         let decoded_chunk = chunk.decode_chunk(data_parts).unwrap();
         let parity_parts = total_parts - data_parts;
         let mut rs = ReedSolomonWrapper::new(data_parts, parity_parts);
@@ -2060,7 +2396,9 @@ pub fn run_catchup(
     let state_split = move |msg: StateSplitRequest| {
         state_split_inside_messages.write().unwrap().push(msg);
     };
-    let rt = client.runtime_adapter.clone();
+    let runtime = client.runtime_adapter.clone();
+    let _ = System::new();
+    let state_parts_arbiter_handle = Arbiter::new().handle();
     loop {
         client.run_catchup(
             highest_height_peers,
@@ -2068,6 +2406,7 @@ pub fn run_catchup(
             &block_catch_up,
             &state_split,
             Arc::new(|_| {}),
+            &state_parts_arbiter_handle,
         )?;
         let mut catchup_done = true;
         for msg in block_messages.write().unwrap().drain(..) {
@@ -2083,7 +2422,7 @@ pub fn run_catchup(
             catchup_done = false;
         }
         for msg in state_split_messages.write().unwrap().drain(..) {
-            let results = rt.build_state_for_split_shards(
+            let results = runtime.build_state_for_split_shards(
                 msg.shard_uid,
                 &msg.state_root,
                 &msg.next_epoch_shard_layout,

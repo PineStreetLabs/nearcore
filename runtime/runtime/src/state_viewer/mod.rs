@@ -18,7 +18,7 @@ use near_primitives::{
     views::{StateItem, ViewApplyState, ViewStateResult},
 };
 use near_store::{get_access_key, get_account, get_code, TrieUpdate};
-use near_vm_logic::{ReturnData, ViewConfig};
+use near_vm_runner::logic::{ReturnData, ViewConfig};
 use std::{str, sync::Arc, time::Instant};
 use tracing::debug;
 
@@ -148,11 +148,7 @@ impl TrieViewer {
         iter.seek_prefix(&query)?;
         for item in &mut iter {
             let (key, value) = item?;
-            values.push(StateItem {
-                key: key[acc_sep_len..].to_vec(),
-                value: value,
-                proof: vec![],
-            });
+            values.push(StateItem { key: key[acc_sep_len..].to_vec().into(), value: value.into() });
         }
         let proof = iter.into_visited_nodes();
         Ok(ViewStateResult { values, proof })

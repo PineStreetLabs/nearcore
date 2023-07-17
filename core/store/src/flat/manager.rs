@@ -3,7 +3,7 @@ use crate::flat::{
 };
 use near_primitives::errors::StorageError;
 use near_primitives::hash::CryptoHash;
-use near_primitives::shard_layout::{ShardLayout, ShardUId};
+use near_primitives::shard_layout::ShardUId;
 use near_primitives::types::BlockHeight;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -39,10 +39,6 @@ impl FlatStorageManager {
     }
 
     pub fn test(store: Store, shard_uids: &[ShardUId], flat_head: CryptoHash) -> Self {
-        if !cfg!(feature = "protocol_feature_flat_state") {
-            return Self::new(store);
-        }
-
         let mut flat_storages = HashMap::default();
         for shard_uid in shard_uids {
             let mut store_update = store.store_update();
@@ -54,15 +50,15 @@ impl FlatStorageManager {
                 }),
             );
             store_update.commit().expect("failed to set flat storage status");
-            flat_storages.insert(*shard_uid, FlatStorage::new(store.clone(), *shard_uid));
+            flat_storages.insert(*shard_uid, FlatStorage::new(store.clone(), *shard_uid).unwrap());
         }
         Self(Arc::new(FlatStorageManagerInner { store, flat_storages: Mutex::new(flat_storages) }))
     }
 
     /// When a node starts from an empty database, this function must be called to ensure
     /// information such as flat head is set up correctly in the database.
-    /// Note that this function is different from `add_flat_storage_for_shard`,
-    /// it must be called before `add_flat_storage_for_shard` if the node starts from
+    /// Note that this function is different from `create_flat_storage_for_shard`,
+    /// it must be called before `create_flat_storage_for_shard` if the node starts from
     /// an empty database.
     pub fn set_flat_storage_for_genesis(
         &self,
@@ -82,85 +78,99 @@ impl FlatStorageManager {
         );
     }
 
-    /// Add a flat storage state for shard `shard_id`. The function also checks that
+    /// Creates flat storage instance for shard `shard_id`. The function also checks that
     /// the shard's flat storage state hasn't been set before, otherwise it panics.
     /// TODO (#7327): this behavior may change when we implement support for state sync
     /// and resharding.
-    pub fn add_flat_storage_for_shard(&self, shard_uid: ShardUId, flat_storage: FlatStorage) {
+    pub fn create_flat_storage_for_shard(&self, shard_uid: ShardUId) -> Result<(), StorageError> {
         let mut flat_storages = self.0.flat_storages.lock().expect(POISONED_LOCK_ERR);
-        let original_value = flat_storages.insert(shard_uid, flat_storage);
+        let original_value =
+            flat_storages.insert(shard_uid, FlatStorage::new(self.0.store.clone(), shard_uid)?);
         // TODO (#7327): maybe we should propagate the error instead of assert here
         // assert is fine now because this function is only called at construction time, but we
         // will need to be more careful when we want to implement flat storage for resharding
         assert!(original_value.is_none());
+        Ok(())
     }
 
-    /// Creates `FlatStorageChunkView` to access state for `shard_id` and block `block_hash`. Note that
-    /// the state includes changes by the block `block_hash`.
-    /// `block_hash`: only create FlatStorageChunkView if it is not None. This is a hack we have temporarily
-    ///               to not introduce too many changes in the trie interface.
-    /// `is_view`: whether this flat state is used for view client. We use a separate set of caches
-    ///            for flat state for client vs view client. For now, we don't support flat state
-    ///            for view client, so we simply return None if `is_view` is True.
-    /// TODO (#7327): take block_hash as CryptoHash instead of Option<CryptoHash>
-    /// TODO (#7327): implement support for view_client
+    pub fn get_flat_storage_status(&self, shard_uid: ShardUId) -> FlatStorageStatus {
+        store_helper::get_flat_storage_status(&self.0.store, shard_uid)
+            .expect("failed to read flat storage status")
+    }
+
+    /// Creates `FlatStorageChunkView` to access state for `shard_uid` and block `block_hash`.
+    /// Note that:
+    /// * the state includes changes by the block `block_hash`;
+    /// * request to get value locks shared `FlatStorage` struct which may cause write slowdowns.
     pub fn chunk_view(
         &self,
         shard_uid: ShardUId,
-        block_hash: Option<CryptoHash>,
-        is_view: bool,
+        block_hash: CryptoHash,
     ) -> Option<FlatStorageChunkView> {
-        let block_hash = match block_hash {
-            Some(block_hash) => block_hash,
-            None => {
-                return None;
+        let flat_storage = {
+            let flat_storages = self.0.flat_storages.lock().expect(POISONED_LOCK_ERR);
+            // It is possible that flat storage state does not exist yet because it is being created in
+            // background.
+            match flat_storages.get(&shard_uid) {
+                Some(flat_storage) => flat_storage.clone(),
+                None => {
+                    debug!(target: "store", "FlatStorage is not ready");
+                    return None;
+                }
             }
         };
-
-        if is_view {
-            // TODO (#7327): Technically, like TrieCache, we should have a separate set of caches for Client and
-            // ViewClient. Right now, we can get by by not enabling flat state for view trie
-            None
-        } else {
-            let flat_storage = {
-                let flat_storages = self.0.flat_storages.lock().expect(POISONED_LOCK_ERR);
-                // It is possible that flat storage state does not exist yet because it is being created in
-                // background.
-                match flat_storages.get(&shard_uid) {
-                    Some(flat_storage) => flat_storage.clone(),
-                    None => {
-                        debug!(target: "chain", "FlatStorage is not ready");
-                        return None;
-                    }
-                }
-            };
-            Some(FlatStorageChunkView::new(self.0.store.clone(), block_hash, flat_storage))
-        }
+        Some(FlatStorageChunkView::new(self.0.store.clone(), block_hash, flat_storage))
     }
 
-    // TODO (#7327): change the function signature to Result<FlatStorage, Error> when
-    // we stabilize feature protocol_feature_flat_state. We use option now to return None when
-    // the feature is not enabled. Ideally, it should return an error because it is problematic
-    // if the flat storage state does not exist
+    // TODO (#7327): consider returning Result<FlatStorage, Error> when we expect flat storage to exist
     pub fn get_flat_storage_for_shard(&self, shard_uid: ShardUId) -> Option<FlatStorage> {
         let flat_storages = self.0.flat_storages.lock().expect(POISONED_LOCK_ERR);
         flat_storages.get(&shard_uid).cloned()
     }
 
-    pub fn remove_flat_storage_for_shard(
-        &self,
-        shard_uid: ShardUId,
-        shard_layout: ShardLayout,
-    ) -> Result<(), StorageError> {
+    pub fn remove_flat_storage_for_shard(&self, shard_uid: ShardUId) -> Result<(), StorageError> {
         let mut flat_storages = self.0.flat_storages.lock().expect(POISONED_LOCK_ERR);
 
-        match flat_storages.remove(&shard_uid) {
-            None => {}
-            Some(flat_storage) => {
-                flat_storage.clear_state(shard_layout)?;
-            }
+        if let Some(flat_store) = flat_storages.remove(&shard_uid) {
+            flat_store.clear_state()?;
         }
 
         Ok(())
+    }
+
+    /// Updates `move_head_enabled` for all shards and returns whether it succeeded.
+    /// If at least one of the shards fails to update move_head_enabled, then that operation is rolled back for all shards.
+    ///
+    /// Rollbacks should work, because we assume that this function is the only
+    /// entry point to locking/unlocking flat head updates in a system with
+    /// multiple FlatStorages running in parallel.
+    pub fn set_flat_state_updates_mode(&self, enabled: bool) -> bool {
+        let flat_storages = self.0.flat_storages.lock().expect(POISONED_LOCK_ERR);
+        let mut all_updated = true;
+        let mut updated_flat_storages = vec![];
+        let mut updated_shard_uids = vec![];
+        for (shard_uid, flat_storage) in flat_storages.iter() {
+            if flat_storage.set_flat_head_update_mode(enabled) {
+                updated_flat_storages.push(flat_storage);
+                updated_shard_uids.push(shard_uid);
+            } else {
+                all_updated = false;
+                tracing::error!(target: "store", rolling_back_shards = ?updated_shard_uids, enabled, ?shard_uid, "Locking/Unlocking of flat head updates failed for shard. Reverting.");
+                break;
+            }
+        }
+        if all_updated {
+            tracing::debug!(target: "store", enabled, "Locking/Unlocking of flat head updates succeeded");
+            true
+        } else {
+            // Do rollback.
+            // It does allow for a data race if somebody updates move_head_enabled on individual shards.
+            // The assumption is that all shards get locked/unlocked at the same time.
+            for flat_storage in updated_flat_storages {
+                flat_storage.set_flat_head_update_mode(!enabled);
+            }
+            tracing::error!(target: "store", enabled, "Locking/Unlocking of flat head updates failed");
+            false
+        }
     }
 }
