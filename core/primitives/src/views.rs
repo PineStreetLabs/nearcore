@@ -2299,11 +2299,6 @@ pub struct ActionCreationConfigView {
 
     /// Base cost of deleting an account.
     pub delete_account_cost: Fee,
-
-    /// Base cost for processing a delegate action.
-    ///
-    /// This is on top of the costs for the actions inside the delegate action.
-    pub delegate_cost: Fee,
 }
 
 /// Describes the cost of creating an access key.
@@ -2379,7 +2374,6 @@ impl From<RuntimeConfig> for RuntimeConfigView {
                     },
                     delete_key_cost: config.fees.fee(ActionCosts::delete_key).clone(),
                     delete_account_cost: config.fees.fee(ActionCosts::delete_account).clone(),
-                    delegate_cost: config.fees.fee(ActionCosts::delegate).clone(),
                 },
                 storage_usage_config: StorageUsageConfigView {
                     num_bytes_account: config.fees.storage_usage_config.num_bytes_account,
